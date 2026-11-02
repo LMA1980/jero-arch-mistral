@@ -158,7 +158,8 @@ mod tests {
     fn test_mistral_prefill_and_decode_step() {
         use k3_core::ArchRecipe;
 
-        let recipe = MistralRecipe::new_mixtral();
+        let mut recipe = MistralRecipe::new_mixtral();
+        recipe.num_layers = 1;
         let weights = TestWeights;
 
         let prompt = [1_u32, 2, 3];

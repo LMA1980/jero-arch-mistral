@@ -57,13 +57,15 @@ pub fn evaluate_moe_memlock_admission(
             "Q6_K" => 40_800_000_000,   // ~38.0 GiB
             "Q8_0" => 53_150_000_000,   // ~49.5 GiB
             "F16" | "BF16" => 100_200_000_000,
-            _ => 26_300_000_000,        // default Q4_0 (~24.5 GiB)
+            _ => 26_300_000_000, // default Q4_0 (~24.5 GiB)
         }
     };
     let weight_bytes = align_up_u64(weight_bytes_raw, 4096);
 
     // 2. Determine KV cache footprint
-    let kv_bytes_raw = manifest.context_length.saturating_mul(MIXTRAL_KV_BYTES_PER_TOKEN);
+    let kv_bytes_raw = manifest
+        .context_length
+        .saturating_mul(MIXTRAL_KV_BYTES_PER_TOKEN);
     let kv_bytes = align_up_u64(kv_bytes_raw, 4096);
 
     let total_required = weight_bytes.saturating_add(kv_bytes);

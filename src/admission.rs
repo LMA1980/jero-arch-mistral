@@ -15,9 +15,19 @@ pub const DEFAULT_MEMLOCK_LIMIT_BYTES: u64 = 29_360_128 * 1024;
 /// Mixtral-8x7B KV cache bytes per token: 32 layers * 2 (K and V) * 8 KV heads * 128 `head_dim` * 2 bytes (F16/BF16).
 pub const MIXTRAL_KV_BYTES_PER_TOKEN: u64 = 32 * 2 * 8 * 128 * 2;
 
-/// Helper rounding `val` up to the next multiple of `align`.
+/// Helper safely rounding `val` up to the next multiple of `align` without integer overflow.
+///
+/// If `align` is zero, returns `val`. If rounding up would overflow `u64`, saturates to `u64::MAX`.
 const fn align_up_u64(val: u64, align: u64) -> u64 {
-    (val + align - 1) & !(align - 1)
+    if align == 0 {
+        return val;
+    }
+    let rem = val % align;
+    if rem == 0 {
+        val
+    } else {
+        val.saturating_add(align - rem)
+    }
 }
 
 /// Evaluates pre-flight physical memory admission for `MoE` models (specifically Mixtral-8x7B)

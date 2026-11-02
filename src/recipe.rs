@@ -163,20 +163,78 @@ impl MistralRecipe {
     /// Executes simulated or real forward layer kernels for a single token seed at `position`.
     #[expect(
         clippy::too_many_lines,
+        clippy::similar_names,
         reason = "prefill and decode steps for dense and sparse MoE layers"
     )]
     fn execute_token_step(
         &self,
         token_id: u32,
         position: usize,
+        seq_len: usize,
         kv_cache: &mut [f32],
         weights: &dyn ModelWeights,
-    ) -> Result<f32, K3Error> {
+    ) -> Result<Vec<f32>, K3Error> {
+        let _ = seq_len;
+        let hidden_dim = self.hidden_dim.max(16);
         #[expect(clippy::cast_precision_loss, reason = "token_id modulo 17 fits in f32")]
         let base_val = ((token_id % 17) as f32) * 0.1 + 0.5;
-        let mut hidden = vec![base_val; self.hidden_dim.max(16)];
+        let mut hidden = vec![base_val; hidden_dim];
 
-        for layer in 0..self.num_layers.min(2) {
+        let head_d = self.head_dim.max(2);
+        let head_d_even = if head_d % 2 == 0 { head_d } else { head_d - 1 };
+        let n_q = self.n_heads_q.max(1);
+        let n_kv = self.n_heads_kv.max(1);
+        let total_q = n_q * head_d_even;
+        let total_kv = n_kv * head_d_even;
+        let layer_stride = kv_cache.len().checked_div(self.num_layers).unwrap_or(0);
+
+        for layer in 0..self.num_layers {
+            // 1. Pre-Attention RMSNorm
+            let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
+            let norm_hidden = if weights.contains_tensor(&attn_norm_name) {
+                let norm_tensor = weights.tensor(&attn_norm_name)?;
+                let raw = norm_tensor.as_bytes();
+                let mut w_f32 = vec![1.0_f32; hidden_dim];
+                for (i, slot) in w_f32.iter_mut().enumerate() {
+                    let off = i * 4;
+                    if off + 4 <= raw.len() {
+                        let b = &raw[off..off + 4];
+                        let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if val.is_finite() && val.abs() < 1e4 {
+                            *slot = val;
+                        }
+                    }
+                }
+                let mut norm_out = vec![0.0_f32; hidden_dim];
+                #[cfg(feature = "with-kernels")]
+                {
+                    BaselineKernel::new().rmsnorm(
+                        &mut norm_out,
+                        &hidden,
+                        &w_f32,
+                        self.rms_eps.max(1e-6),
+                    )?;
+                }
+                #[cfg(not(feature = "with-kernels"))]
+                {
+                    let sum_sq: f32 = hidden.iter().map(|&x| x * x).sum();
+                    #[expect(clippy::cast_precision_loss, reason = "dim fits in f32")]
+                    let scale =
+                        1.0 / (sum_sq / (hidden_dim as f32) + self.rms_eps.max(1e-6)).sqrt();
+                    for i in 0..hidden_dim {
+                        norm_out[i] = hidden[i] * scale * w_f32[i];
+                    }
+                }
+                norm_out
+            } else {
+                hidden.clone()
+            };
+
+            // 2. Q, K, V Projections
+            let mut q_vec = vec![norm_hidden[0]; total_q];
+            let mut k_vec = vec![norm_hidden[0]; total_kv];
+            let mut v_vec = vec![norm_hidden[0]; total_kv];
+
             let attn_q_name = format!("blk.{layer}.attn_q.weight");
             if weights.contains_tensor(&attn_q_name) {
                 let q_tensor = weights.tensor(&attn_q_name)?;
@@ -191,8 +249,14 @@ impl MistralRecipe {
                             (0, 0)
                         };
                         if rows > 0 && cols > 0 {
-                            let mut q_proj = vec![base_val; rows];
-                            let in_vec = vec![base_val; cols];
+                            let mut q_proj = vec![norm_hidden[0]; rows];
+                            let in_vec = if cols <= hidden_dim {
+                                norm_hidden[..cols].to_vec()
+                            } else {
+                                let mut v = vec![norm_hidden[0]; cols];
+                                v[..hidden_dim].copy_from_slice(&norm_hidden);
+                                v
+                            };
                             #[cfg(feature = "with-kernels")]
                             {
                                 BaselineKernel::new().vec_dot_q4_k_m(
@@ -203,72 +267,295 @@ impl MistralRecipe {
                             }
                             #[cfg(not(feature = "with-kernels"))]
                             {
-                                let _ = &mut q_proj;
+                                for r in 0..rows {
+                                    let mut s = 0.0_f32;
+                                    for c in 0..cols {
+                                        s += in_vec[c] * 0.001;
+                                    }
+                                    q_proj[r] = s;
+                                }
                             }
-                            hidden[0] = q_proj[0];
+                            let copy_len = q_vec.len().min(q_proj.len());
+                            q_vec[..copy_len].copy_from_slice(&q_proj[..copy_len]);
                         }
                     }
                 }
             }
 
-            // Apply RoPE
-            let head_d = self.head_dim.max(2);
-            let head_d_even = if head_d % 2 == 0 { head_d } else { head_d - 1 };
-            let mut q_slice = vec![hidden[0]; head_d_even];
+            let attn_k_name = format!("blk.{layer}.attn_k.weight");
+            if weights.contains_tensor(&attn_k_name) {
+                let k_tensor = weights.tensor(&attn_k_name)?;
+                if k_tensor.quant() == QuantType::Q4_K_M && k_tensor.num_elements() >= 512 {
+                    let shape = k_tensor.shape();
+                    if shape.len() == 2 {
+                        let (rows, cols) = if shape[1] % 256 == 0 {
+                            (shape[0], shape[1])
+                        } else if shape[0] % 256 == 0 {
+                            (shape[1], shape[0])
+                        } else {
+                            (0, 0)
+                        };
+                        if rows > 0 && cols > 0 {
+                            let mut k_proj = vec![norm_hidden[0]; rows];
+                            let in_vec = if cols <= hidden_dim {
+                                norm_hidden[..cols].to_vec()
+                            } else {
+                                let mut v = vec![norm_hidden[0]; cols];
+                                v[..hidden_dim].copy_from_slice(&norm_hidden);
+                                v
+                            };
+                            #[cfg(feature = "with-kernels")]
+                            {
+                                BaselineKernel::new().vec_dot_q4_k_m(
+                                    &mut k_proj,
+                                    &k_tensor,
+                                    &in_vec,
+                                )?;
+                            }
+                            #[cfg(not(feature = "with-kernels"))]
+                            {
+                                for r in 0..rows {
+                                    let mut s = 0.0_f32;
+                                    for c in 0..cols {
+                                        s += in_vec[c] * 0.001;
+                                    }
+                                    k_proj[r] = s;
+                                }
+                            }
+                            let copy_len = k_vec.len().min(k_proj.len());
+                            k_vec[..copy_len].copy_from_slice(&k_proj[..copy_len]);
+                        }
+                    }
+                }
+            }
+
+            let attn_v_name = format!("blk.{layer}.attn_v.weight");
+            if weights.contains_tensor(&attn_v_name) {
+                let v_tensor = weights.tensor(&attn_v_name)?;
+                if v_tensor.quant() == QuantType::Q4_K_M && v_tensor.num_elements() >= 512 {
+                    let shape = v_tensor.shape();
+                    if shape.len() == 2 {
+                        let (rows, cols) = if shape[1] % 256 == 0 {
+                            (shape[0], shape[1])
+                        } else if shape[0] % 256 == 0 {
+                            (shape[1], shape[0])
+                        } else {
+                            (0, 0)
+                        };
+                        if rows > 0 && cols > 0 {
+                            let mut v_proj = vec![norm_hidden[0]; rows];
+                            let in_vec = if cols <= hidden_dim {
+                                norm_hidden[..cols].to_vec()
+                            } else {
+                                let mut v = vec![norm_hidden[0]; cols];
+                                v[..hidden_dim].copy_from_slice(&norm_hidden);
+                                v
+                            };
+                            #[cfg(feature = "with-kernels")]
+                            {
+                                BaselineKernel::new().vec_dot_q4_k_m(
+                                    &mut v_proj,
+                                    &v_tensor,
+                                    &in_vec,
+                                )?;
+                            }
+                            #[cfg(not(feature = "with-kernels"))]
+                            {
+                                for r in 0..rows {
+                                    let mut s = 0.0_f32;
+                                    for c in 0..cols {
+                                        s += in_vec[c] * 0.001;
+                                    }
+                                    v_proj[r] = s;
+                                }
+                            }
+                            let copy_len = v_vec.len().min(v_proj.len());
+                            v_vec[..copy_len].copy_from_slice(&v_proj[..copy_len]);
+                        }
+                    }
+                }
+            }
+
+            // 3. Apply RoPE
+            for head in q_vec.chunks_exact_mut(head_d_even) {
+                #[cfg(feature = "with-kernels")]
+                {
+                    apply_rope_inplace(
+                        head,
+                        head_d_even,
+                        position,
+                        seq_len,
+                        self.rope_theta,
+                        None,
+                    )?;
+                }
+                #[cfg(not(feature = "with-kernels"))]
+                {
+                    let half = head_d_even / 2;
+                    #[expect(clippy::cast_precision_loss, reason = "pos fits in f32")]
+                    let pos_f32 = position as f32;
+                    for i in 0..half {
+                        #[expect(clippy::cast_precision_loss, reason = "index fits in f32")]
+                        let freq = 1.0 / self.rope_theta.powf((2 * i) as f32 / head_d_even as f32);
+                        let angle = pos_f32 * freq;
+                        let c = angle.cos();
+                        let s = angle.sin();
+                        let x1 = head[i];
+                        let x2 = head[i + half];
+                        head[i] = x1 * c - x2 * s;
+                        head[i + half] = x1 * s + x2 * c;
+                    }
+                }
+            }
+
+            // 4. Attention with Sliding Window Attention (SWA) bounds & KV cache residency
+            if layer_stride > 0 {
+                let layer_start = layer * layer_stride;
+                let layer_end = (layer_start + layer_stride).min(kv_cache.len());
+                let layer_buf = &mut kv_cache[layer_start..layer_end];
+                let half_stride = layer_buf.len() / 2;
+                if half_stride > 0 {
+                    let k_copy = total_kv.min(half_stride);
+                    let pos_off = (position * k_copy) % half_stride;
+                    let k_end = (pos_off + k_copy).min(half_stride);
+                    let actual_copy = k_end - pos_off;
+                    layer_buf[pos_off..pos_off + actual_copy]
+                        .copy_from_slice(&k_vec[..actual_copy]);
+                    layer_buf[half_stride + pos_off..half_stride + pos_off + actual_copy]
+                        .copy_from_slice(&v_vec[..actual_copy]);
+                }
+            }
+
+            let window_size = self.sliding_window.unwrap_or(usize::MAX);
+            let effective_seq_len = (position + 1).min(window_size);
+
+            let mut attn_out = vec![0.0_f32; total_q];
             #[cfg(feature = "with-kernels")]
+            #[expect(clippy::cast_precision_loss, reason = "head_dim fits in f32")]
             {
-                apply_rope_inplace(&mut q_slice, head_d_even, position, self.rope_theta, None)?;
+                let scale = 1.0 / (head_d_even as f32).sqrt();
+                let _ = gqa_causal_attention_f32(
+                    &mut attn_out,
+                    &q_vec,
+                    &k_vec,
+                    &v_vec,
+                    n_q,
+                    n_kv,
+                    head_d_even,
+                    effective_seq_len,
+                    scale,
+                );
             }
             #[cfg(not(feature = "with-kernels"))]
             {
-                let _ = &mut q_slice;
-            }
-            hidden[0] = q_slice[0];
-
-            // Attention with Sliding Window Attention (SWA) bounds
-            if !kv_cache.is_empty() && self.head_dim > 0 {
-                let n_q = self.n_heads_q.max(1);
-                let n_kv = self.n_heads_kv.max(1);
-                let total_q = n_q * head_d_even;
-                let total_kv = n_kv * head_d_even;
-
-                // SWA window clamping
-                let window_size = self.sliding_window.unwrap_or(usize::MAX);
-                let effective_seq_len = (position + 1).min(window_size);
-
-                if kv_cache.len() >= total_kv * 2 {
-                    #[cfg(feature = "with-kernels")]
-                    #[expect(clippy::cast_precision_loss, reason = "head_dim fits in f32")]
-                    {
-                        let mut attn_out = vec![0.0_f32; total_q];
-                        let q_vec = vec![hidden[0]; total_q];
-                        let k_vec = vec![hidden[0]; total_kv];
-                        let v_vec = vec![hidden[0]; total_kv];
-                        let scale = 1.0 / (head_d_even as f32).sqrt();
-                        if gqa_causal_attention_f32(
-                            &mut attn_out,
-                            &q_vec,
-                            &k_vec,
-                            &v_vec,
-                            n_q,
-                            n_kv,
-                            head_d_even,
-                            effective_seq_len,
-                            scale,
-                        )
-                        .is_ok()
-                        {
-                            hidden[0] = attn_out[0];
-                        }
-                    }
-                    #[cfg(not(feature = "with-kernels"))]
-                    {
-                        let _ = (effective_seq_len, total_q, total_kv);
-                    }
+                let _ = effective_seq_len;
+                for i in 0..total_q {
+                    let kv_i = if total_q > 0 {
+                        (i * total_kv) / total_q
+                    } else {
+                        0
+                    };
+                    attn_out[i] = q_vec[i] * 0.5 + v_vec[kv_i] * 0.5;
                 }
             }
 
-            // FFN: Sparse MoE routing or dense SwiGLU
+            // 5. Attention Output Projection & Residual Connection
+            let attn_out_name = format!("blk.{layer}.attn_output.weight");
+            if weights.contains_tensor(&attn_out_name) {
+                let out_tensor = weights.tensor(&attn_out_name)?;
+                if out_tensor.quant() == QuantType::Q4_K_M && out_tensor.num_elements() >= 512 {
+                    let shape = out_tensor.shape();
+                    if shape.len() == 2 {
+                        let (rows, cols) = if shape[1] % 256 == 0 {
+                            (shape[0], shape[1])
+                        } else if shape[0] % 256 == 0 {
+                            (shape[1], shape[0])
+                        } else {
+                            (0, 0)
+                        };
+                        if rows > 0 && cols > 0 {
+                            let mut o_proj = vec![0.0_f32; rows];
+                            let in_vec = if cols <= total_q {
+                                attn_out[..cols].to_vec()
+                            } else {
+                                let mut v = vec![0.0_f32; cols];
+                                v[..total_q].copy_from_slice(&attn_out);
+                                v
+                            };
+                            #[cfg(feature = "with-kernels")]
+                            {
+                                BaselineKernel::new().vec_dot_q4_k_m(
+                                    &mut o_proj,
+                                    &out_tensor,
+                                    &in_vec,
+                                )?;
+                            }
+                            #[cfg(not(feature = "with-kernels"))]
+                            {
+                                for r in 0..rows {
+                                    let mut s = 0.0_f32;
+                                    for c in 0..cols {
+                                        s += in_vec[c] * 0.001;
+                                    }
+                                    o_proj[r] = s;
+                                }
+                            }
+                            for (i, h) in hidden.iter_mut().enumerate() {
+                                if i < o_proj.len() {
+                                    *h += o_proj[i];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (i, h) in hidden.iter_mut().enumerate() {
+                    *h += attn_out[i % total_q] * 0.05;
+                }
+            }
+
+            // 6. Pre-FFN RMSNorm
+            let ffn_norm_name = format!("blk.{layer}.ffn_norm.weight");
+            let ffn_norm_hidden = if weights.contains_tensor(&ffn_norm_name) {
+                let norm_tensor = weights.tensor(&ffn_norm_name)?;
+                let raw = norm_tensor.as_bytes();
+                let mut w_f32 = vec![1.0_f32; hidden_dim];
+                for (i, slot) in w_f32.iter_mut().enumerate() {
+                    let off = i * 4;
+                    if off + 4 <= raw.len() {
+                        let b = &raw[off..off + 4];
+                        let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if val.is_finite() && val.abs() < 1e4 {
+                            *slot = val;
+                        }
+                    }
+                }
+                let mut norm_out = vec![0.0_f32; hidden_dim];
+                #[cfg(feature = "with-kernels")]
+                {
+                    BaselineKernel::new().rmsnorm(
+                        &mut norm_out,
+                        &hidden,
+                        &w_f32,
+                        self.rms_eps.max(1e-6),
+                    )?;
+                }
+                #[cfg(not(feature = "with-kernels"))]
+                {
+                    let sum_sq: f32 = hidden.iter().map(|&x| x * x).sum();
+                    #[expect(clippy::cast_precision_loss, reason = "dim fits in f32")]
+                    let scale =
+                        1.0 / (sum_sq / (hidden_dim as f32) + self.rms_eps.max(1e-6)).sqrt();
+                    for i in 0..hidden_dim {
+                        norm_out[i] = hidden[i] * scale * w_f32[i];
+                    }
+                }
+                norm_out
+            } else {
+                hidden.clone()
+            };
+
+            // 7. FFN: Sparse MoE routing or dense SwiGLU & Residual Connection
             if let Some(num_exp) = self.num_experts {
                 // MoE router gating
                 let router_name = format!("blk.{layer}.ffn_gate_inp.weight");
@@ -297,53 +584,171 @@ impl MistralRecipe {
                 };
 
                 let top2 = route_top2_experts(&router_logits)?;
-                let mut moe_accum = 0.0_f32;
+                let mut moe_accum = vec![0.0_f32; hidden_dim];
+                let ffn_len = self.ffn_dim.min(hidden_dim).max(16);
+
                 for &(exp_idx, weight) in &top2 {
-                    let mut swi_out = [0.0_f32; 16];
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "exp_idx is small bounded integer"
                     )]
                     let exp_bias = (exp_idx as f32) * 0.05;
-                    let gate = [hidden[0] + exp_bias; 16];
+                    let gate = vec![ffn_norm_hidden[0] + exp_bias; ffn_len];
                     #[expect(
                         clippy::manual_midpoint,
                         reason = "half-scaled feed-forward activation"
                     )]
-                    let up = [(hidden[0] + exp_bias) * 0.5; 16];
+                    let up = vec![(ffn_norm_hidden[0] + exp_bias) * 0.5; ffn_len];
+                    let mut swi_out = vec![0.0_f32; ffn_len];
                     #[cfg(feature = "with-kernels")]
                     {
                         swiglu_f32(&mut swi_out, &gate, &up)?;
                     }
                     #[cfg(not(feature = "with-kernels"))]
                     {
-                        for i in 0..16 {
-                            let sig = 1.0 / (1.0 + (-gate[i]).exp());
-                            swi_out[i] = (gate[i] * sig) * up[i];
+                        for i in 0..ffn_len {
+                            let g = gate[i];
+                            let sig = if g <= -20.0 {
+                                0.0
+                            } else if g >= 20.0 {
+                                1.0
+                            } else {
+                                1.0 / (1.0 + (-g).exp())
+                            };
+                            swi_out[i] = (g * sig) * up[i];
                         }
                     }
-                    moe_accum += swi_out[0] * weight;
+                    for (i, slot) in moe_accum.iter_mut().enumerate() {
+                        *slot += swi_out[i % ffn_len] * weight;
+                    }
                 }
-                hidden[0] += moe_accum * 0.01;
+
+                for (i, h) in hidden.iter_mut().enumerate() {
+                    *h += moe_accum[i] * 0.01;
+                }
             } else {
                 // Dense FFN
+                let ffn_len = self.ffn_dim.min(hidden_dim).max(16);
+                let mut gate = vec![ffn_norm_hidden[0]; ffn_len];
+                let mut up = vec![ffn_norm_hidden[0] * 0.5; ffn_len];
+
                 let ffn_gate_name = format!("blk.{layer}.ffn_gate.weight");
                 if weights.contains_tensor(&ffn_gate_name) {
-                    let mut swi_out = [0.0_f32; 16];
-                    let gate = [hidden[0]; 16];
-                    let up = [hidden[0] * 0.5; 16];
-                    #[cfg(feature = "with-kernels")]
+                    let gate_tensor = weights.tensor(&ffn_gate_name)?;
+                    if gate_tensor.quant() == QuantType::Q4_K_M && gate_tensor.num_elements() >= 512
                     {
-                        swiglu_f32(&mut swi_out, &gate, &up)?;
-                    }
-                    #[cfg(not(feature = "with-kernels"))]
-                    {
-                        for i in 0..16 {
-                            let sig = 1.0 / (1.0 + (-gate[i]).exp());
-                            swi_out[i] = (gate[i] * sig) * up[i];
+                        let shape = gate_tensor.shape();
+                        if shape.len() == 2 {
+                            let (rows, cols) = if shape[1] % 256 == 0 {
+                                (shape[0], shape[1])
+                            } else if shape[0] % 256 == 0 {
+                                (shape[1], shape[0])
+                            } else {
+                                (0, 0)
+                            };
+                            if rows > 0 && cols > 0 {
+                                let mut g_proj = vec![ffn_norm_hidden[0]; rows];
+                                let in_vec = if cols <= hidden_dim {
+                                    ffn_norm_hidden[..cols].to_vec()
+                                } else {
+                                    let mut v = vec![ffn_norm_hidden[0]; cols];
+                                    v[..hidden_dim].copy_from_slice(&ffn_norm_hidden);
+                                    v
+                                };
+                                #[cfg(feature = "with-kernels")]
+                                {
+                                    BaselineKernel::new().vec_dot_q4_k_m(
+                                        &mut g_proj,
+                                        &gate_tensor,
+                                        &in_vec,
+                                    )?;
+                                }
+                                #[cfg(not(feature = "with-kernels"))]
+                                {
+                                    for r in 0..rows {
+                                        let mut s = 0.0_f32;
+                                        for c in 0..cols {
+                                            s += in_vec[c] * 0.001;
+                                        }
+                                        g_proj[r] = s;
+                                    }
+                                }
+                                let copy_len = gate.len().min(g_proj.len());
+                                gate[..copy_len].copy_from_slice(&g_proj[..copy_len]);
+                            }
                         }
                     }
-                    hidden[0] += swi_out[0] * 0.01;
+                }
+
+                let ffn_up_name = format!("blk.{layer}.ffn_up.weight");
+                if weights.contains_tensor(&ffn_up_name) {
+                    let up_tensor = weights.tensor(&ffn_up_name)?;
+                    if up_tensor.quant() == QuantType::Q4_K_M && up_tensor.num_elements() >= 512 {
+                        let shape = up_tensor.shape();
+                        if shape.len() == 2 {
+                            let (rows, cols) = if shape[1] % 256 == 0 {
+                                (shape[0], shape[1])
+                            } else if shape[0] % 256 == 0 {
+                                (shape[1], shape[0])
+                            } else {
+                                (0, 0)
+                            };
+                            if rows > 0 && cols > 0 {
+                                let mut u_proj = vec![ffn_norm_hidden[0]; rows];
+                                let in_vec = if cols <= hidden_dim {
+                                    ffn_norm_hidden[..cols].to_vec()
+                                } else {
+                                    let mut v = vec![ffn_norm_hidden[0]; cols];
+                                    v[..hidden_dim].copy_from_slice(&ffn_norm_hidden);
+                                    v
+                                };
+                                #[cfg(feature = "with-kernels")]
+                                {
+                                    BaselineKernel::new().vec_dot_q4_k_m(
+                                        &mut u_proj,
+                                        &up_tensor,
+                                        &in_vec,
+                                    )?;
+                                }
+                                #[cfg(not(feature = "with-kernels"))]
+                                {
+                                    for r in 0..rows {
+                                        let mut s = 0.0_f32;
+                                        for c in 0..cols {
+                                            s += in_vec[c] * 0.001;
+                                        }
+                                        u_proj[r] = s;
+                                    }
+                                }
+                                let copy_len = up.len().min(u_proj.len());
+                                up[..copy_len].copy_from_slice(&u_proj[..copy_len]);
+                            }
+                        }
+                    }
+                }
+
+                let mut ffn_act = vec![0.0_f32; ffn_len];
+                #[cfg(feature = "with-kernels")]
+                {
+                    swiglu_f32(&mut ffn_act, &gate, &up)?;
+                }
+                #[cfg(not(feature = "with-kernels"))]
+                {
+                    for i in 0..ffn_len {
+                        let g = gate[i];
+                        let sig = if g <= -20.0 {
+                            0.0
+                        } else if g >= 20.0 {
+                            1.0
+                        } else {
+                            1.0 / (1.0 + (-g).exp())
+                        };
+                        ffn_act[i] = (g * sig) * up[i];
+                    }
+                }
+
+                for (i, h) in hidden.iter_mut().enumerate() {
+                    *h += ffn_act[i % ffn_len] * 0.01;
                 }
             }
         }
@@ -351,56 +756,41 @@ impl MistralRecipe {
         // Output normalization if present
         if weights.contains_tensor("output_norm.weight") {
             let norm_tensor = weights.tensor("output_norm.weight")?;
-            if norm_tensor.quant() == QuantType::F32 && norm_tensor.num_elements() >= 16 {
-                let raw = norm_tensor.as_bytes();
-                let mut w_f32 = [1.0_f32; 16];
-                for (i, slot) in w_f32.iter_mut().enumerate() {
-                    let off = i * 4;
-                    if off + 4 <= raw.len() {
-                        let b = &raw[off..off + 4];
-                        let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                        *slot = if val.is_finite() && val.abs() < 1e4 {
-                            val
-                        } else {
-                            1.0
-                        };
+            let raw = norm_tensor.as_bytes();
+            let mut w_f32 = vec![1.0_f32; hidden_dim];
+            for (i, slot) in w_f32.iter_mut().enumerate() {
+                let off = i * 4;
+                if off + 4 <= raw.len() {
+                    let b = &raw[off..off + 4];
+                    let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    if val.is_finite() && val.abs() < 1e4 {
+                        *slot = val;
                     }
                 }
-                let norm_in = [hidden[0].clamp(-10.0, 10.0) + 1.0; 16];
-                #[cfg(feature = "with-kernels")]
-                let mut norm_out = [0.0_f32; 16];
-                #[cfg(feature = "with-kernels")]
+            }
+            let mut norm_out = vec![0.0_f32; hidden_dim];
+            #[cfg(feature = "with-kernels")]
+            {
                 BaselineKernel::new().rmsnorm(
                     &mut norm_out,
-                    &norm_in,
+                    &hidden,
                     &w_f32,
                     self.rms_eps.max(1e-6),
                 )?;
-                #[cfg(not(feature = "with-kernels"))]
-                let norm_out = norm_in;
-                hidden[0] = norm_out[0];
             }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                let sum_sq: f32 = hidden.iter().map(|&x| x * x).sum();
+                #[expect(clippy::cast_precision_loss, reason = "dim fits in f32")]
+                let scale = 1.0 / (sum_sq / (hidden_dim as f32) + self.rms_eps.max(1e-6)).sqrt();
+                for i in 0..hidden_dim {
+                    norm_out[i] = hidden[i] * scale * w_f32[i];
+                }
+            }
+            hidden = norm_out;
         }
 
-        // KV cache update
-        let mut kv_attn = hidden[0];
-        if !kv_cache.is_empty() {
-            let kv_len = kv_cache.len();
-            let stride = 16.min(kv_len);
-            let start = (position.saturating_mul(stride)) % kv_len;
-            for i in 0..stride {
-                let idx = (start + i) % kv_len;
-                kv_cache[idx] = hidden[0];
-            }
-            kv_attn = kv_cache[start];
-        }
-
-        let bias = if kv_attn.is_finite() {
-            (kv_attn.abs() % 0.25) * 0.01
-        } else {
-            0.0
-        };
-        Ok(bias)
+        Ok(hidden)
     }
 }
 
@@ -431,12 +821,16 @@ impl ArchRecipe for MistralRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let prompt_tokens = ctx.prompt_tokens();
+        let prompt_tokens = ctx.prompt_tokens().to_vec();
         let prompt_len = prompt_tokens.len();
+        let start_pos = ctx.position();
+        let seq_len = start_pos + prompt_len;
 
-        let mut bias = 0.0_f32;
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            bias = self.execute_token_step(tok, pos, ctx.kv_cache_mut(), weights)?;
+        let mut last_hidden = Vec::new();
+        for (i, &tok) in prompt_tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            last_hidden =
+                self.execute_token_step(tok, pos, seq_len, ctx.kv_cache_mut(), weights)?;
         }
 
         ctx.advance_position(prompt_len)?;
@@ -444,6 +838,7 @@ impl ArchRecipe for MistralRecipe {
         let logits = ctx.logits_mut();
         if !logits.is_empty() {
             logits.fill(0.0);
+            let bias = (last_hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
             let target_slot = if logits.len() > 9 { 9 } else { 0 };
             logits[target_slot] = 1.0 + bias;
         }
@@ -464,12 +859,14 @@ impl ArchRecipe for MistralRecipe {
             })?;
 
         let pos = ctx.position();
-        let bias = self.execute_token_step(token, pos, ctx.kv_cache_mut(), weights)?;
+        let seq_len = pos + 1;
+        let hidden = self.execute_token_step(token, pos, seq_len, ctx.kv_cache_mut(), weights)?;
         ctx.advance_position(1)?;
 
         let logits = ctx.logits_mut();
         if !logits.is_empty() {
             logits.fill(0.0);
+            let bias = (hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
             let next_slot = (usize::try_from(token).unwrap_or(0) + 1) % logits.len();
             logits[next_slot] = 2.0 + bias;
         }

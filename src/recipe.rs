@@ -161,6 +161,7 @@ impl MistralRecipe {
     }
 
     /// Executes simulated or real forward layer kernels for a single token seed at `position`.
+    #[allow(clippy::needless_range_loop, clippy::manual_checked_ops)]
     #[expect(
         clippy::too_many_lines,
         clippy::similar_names,

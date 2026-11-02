@@ -1,7 +1,7 @@
-//! `k3-arch-mistral`: Mistral and Mixtral architecture recipe for the SpacemiT K3 platform.
+//! `k3-arch-mistral`: Mistral and Mixtral architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Mistral and Mixtral models (`mistral`, `mixtral`),
-//! supporting Sliding Window Attention (SWA) and top-2 of 8 Sparse Mixture-of-Experts (MoE).
+//! supporting Sliding Window Attention (SWA) and top-2 of 8 Sparse Mixture-of-Experts (`MoE`).
 
 use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType};
 

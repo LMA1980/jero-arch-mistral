@@ -1,10 +1,10 @@
 version: "1"
-service: "k3-arch-mistral"
+service: "jero-arch-mistral"
 
 deployment:
   target_nodes:
     - "worker-riscv64"
-  binary_name: "k3-arch-mistral"
+  binary_name: "jero-arch-mistral"
 
 integration_tests:
   - "unit-tests"

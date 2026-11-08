@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-mistral Factory Pipeline: Hygiene, Tests, Coverage & Benchmarks"
+name: "jero-arch-mistral Factory Pipeline: Hygiene, Tests, Coverage & Benchmarks"
 
 env:
   CARGO_TERM_COLOR: always

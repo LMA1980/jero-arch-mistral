@@ -3,10 +3,10 @@
 //! Implements [`ArchRecipe`] supporting Sliding Window Attention (SWA) and
 //! top-2 of 8 Sparse Mixture-of-Experts (`MoE`) routing per ADR-023 and ADR-024.
 
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType};
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType};
 
 #[cfg(feature = "with-kernels")]
-use kernels_rvv::{
+use jero_kernels_rvv::{
     BaselineKernel, VectorKernel, apply_rope_inplace, gqa_causal_attention_f32, swiglu_f32,
 };
 

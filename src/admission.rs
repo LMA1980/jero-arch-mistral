@@ -4,7 +4,7 @@
 //! on the `SpacemiT` K3 target platform, preventing unprivileged kernel OOM lockups and guiding
 //! deployment toward `Q4_0` or compact `MoE` architectures per ADR-037.
 
-use k3_core::{K3Error, ModelManifest};
+use jero_core::{K3Error, ModelManifest};
 
 /// Standard structured advisory recommended when Mixtral exceeds the 28 GiB memlock ceiling.
 pub const COMPACT_MOE_ADVISORY: &str = "Mixtral-8x7B in Q4_K_M exceeds 28 GiB memlock headroom; use Q4_0 or deploy compact MoEs: Qwen3-30B-A3B, DeepSeek-V2-Lite-16B, Gemma-4-26B-A4B";

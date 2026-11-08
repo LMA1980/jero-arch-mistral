@@ -1,0 +1,10 @@
+name = "jero-arch-mistral"
+# Crate-embedded Symposium manifest for jero-arch-mistral.
+
+[[plugins]]
+depends-on = ["jero-core"]
+source.cargo = "jero-core"
+
+[[plugins]]
+depends-on = ["jero-kernels-rvv"]
+source.cargo = "jero-kernels-rvv"

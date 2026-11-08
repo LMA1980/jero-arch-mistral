@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-mistral Release Pipeline"
+name: "jero-arch-mistral Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always

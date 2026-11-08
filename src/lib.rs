@@ -1,4 +1,4 @@
-//! `k3-arch-mistral`: Mistral and Mixtral architecture recipe for the `SpacemiT` K3 platform.
+//! `jero-arch-mistral`: Mistral and Mixtral architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Mistral and Mixtral models (`mistral`, `mixtral`),
 //! supporting Sliding Window Attention (SWA), top-2 of 8 Sparse Mixture-of-Experts (`MoE`) routing,
@@ -15,7 +15,9 @@ pub use recipe::{MistralRecipe, route_top2_experts};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{ExecutionContext, K3Error, ModelManifest, ModelWeights, QuantType, TensorView};
+    use jero_core::{
+        ExecutionContext, K3Error, ModelManifest, ModelWeights, QuantType, TensorView,
+    };
 
     struct TestWeights;
 
@@ -41,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_mistral_recipe_basic() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let recipe = MistralRecipe::new();
         assert_eq!(recipe.architecture_id(), "mistral");
@@ -57,7 +59,7 @@ mod tests {
 
     #[test]
     fn test_mixtral_recipe_basic() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let recipe = MistralRecipe::new_mixtral();
         assert_eq!(recipe.architecture_id(), "mixtral");
@@ -156,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_mistral_prefill_and_decode_step() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let mut recipe = MistralRecipe::new_mixtral();
         recipe.num_layers = 1;

@@ -25,7 +25,9 @@ pub use admission::{
     verify_mistral_admission_with_scratch, verify_mistral_recipe_admission,
     verify_mixtral_admission,
 };
-pub use recipe::{MistralRecipe, RopeScalingConfig, route_top2_experts, route_topk_experts};
+pub use recipe::{
+    MistralRecipe, RopeScalingConfig, route_top2_experts, route_topk_experts, route_topk_into,
+};
 pub use repack_cache::{
     CachedDenseProjection, CachedProjectionLookup, DEFAULT_DENSE_F32_MAX_ELEMENTS,
     DEFAULT_MAX_REPACKED_CACHE_BYTES, ExpertSliceMeta, MistralActScratch, MistralCacheStats,

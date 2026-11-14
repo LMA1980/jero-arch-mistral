@@ -8,18 +8,20 @@
 
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, TensorDescriptor, TensorView,
+    ModelMetadata, ModelWeights, QuantType, SCRATCH_ALIGNMENT, ScratchScope, ScratchWorkspace,
+    TensorDescriptor, TensorView,
 };
 
 use crate::admission::validate_token_id_in_vocab;
 pub use crate::kernels_compat::RopeScalingConfig;
 use crate::kernels_compat::{
-    dequantize_embedding_row, gqa_attention_compat, gqa_causal_attention_prefill_compat,
-    matmul_tensor, matvec_tensor, resolve_2d_dims, rmsnorm_compat, rope_inv_freq_compat,
-    swiglu_compat, tensor_bounds_err,
+    dequantize_embedding_row, fill_rope_inv_freq_compat, gqa_attention_with_scratch_compat,
+    gqa_causal_attention_prefill_compat, matmul_tensor, matvec_tensor_rows_parallel,
+    resolve_2d_dims, rmsnorm_compat, rope_inv_freq_compat, swiglu_compat, tensor_bounds_err,
 };
 use crate::repack_cache::{
-    CachedDenseProjection, MistralActScratch, MistralLayerCache, with_shared_model_cache,
+    CachedDenseProjection, DecodeGemvScratch, LayerTensorKeys, MistralActScratch,
+    MistralLayerCache, with_shared_model_cache,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,16 +41,18 @@ struct MistralGeometry {
     moe: Option<(usize, usize)>,
 }
 
-/// Selects the top-`k` experts from router logits and computes normalized softmax gating weights.
+/// Selects the top-`k` experts from `router_logits` without heap allocation, writing normalized
+/// `(expert_index, weight)` pairs into caller-provided `selected_out[..top_k]`.
 ///
 /// # Errors
 ///
 /// Fails closed with [`K3Error::CapabilityMismatch`] if `top_k == 0`, `router_logits.len() < top_k`,
-/// or any router logit is non-finite (`NaN` or `Inf`).
-pub fn route_topk_experts(
+/// `selected_out.len() != top_k`, or any router logit is non-finite (`NaN` or `Inf`).
+pub fn route_topk_into(
     router_logits: &[f32],
     top_k: usize,
-) -> Result<Vec<(usize, f32)>, K3Error> {
+    selected_out: &mut [(usize, f32)],
+) -> Result<(), K3Error> {
     if top_k == 0 {
         return Err(K3Error::CapabilityMismatch {
             architecture: "mixtral".to_owned(),
@@ -64,6 +68,15 @@ pub fn route_topk_experts(
             ),
         });
     }
+    if selected_out.len() != top_k {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "mixtral".to_owned(),
+            reason: format!(
+                "selected_out length {} does not match top_k ({top_k})",
+                selected_out.len()
+            ),
+        });
+    }
 
     for (i, &logit) in router_logits.iter().enumerate() {
         if !logit.is_finite() {
@@ -74,25 +87,58 @@ pub fn route_topk_experts(
         }
     }
 
-    let mut ranked: Vec<(usize, f32)> = router_logits.iter().copied().enumerate().collect();
-    // Sort descending by logit, breaking exact ties by ascending expert index for determinism.
-    ranked.sort_by(|(idx_a, val_a), (idx_b, val_b)| {
-        val_b.total_cmp(val_a).then_with(|| idx_a.cmp(idx_b))
-    });
-    ranked.truncate(top_k);
-
-    let max_val = ranked[0].1;
-    let mut sum = 0.0_f32;
-    let mut exps = Vec::with_capacity(top_k);
-    for &(idx, val) in &ranked {
-        let e = (val - max_val).exp();
-        sum += e;
-        exps.push((idx, e));
+    let mut filled = 0_usize;
+    for (idx, &val) in router_logits.iter().enumerate() {
+        let mut insert_pos = filled;
+        while insert_pos > 0 {
+            let (prev_idx, prev_val) = selected_out[insert_pos - 1];
+            let better = match val.total_cmp(&prev_val) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Less => false,
+                core::cmp::Ordering::Equal => idx < prev_idx,
+            };
+            if !better {
+                break;
+            }
+            if insert_pos < top_k {
+                selected_out[insert_pos] = selected_out[insert_pos - 1];
+            }
+            insert_pos -= 1;
+        }
+        if insert_pos < top_k {
+            selected_out[insert_pos] = (idx, val);
+            if filled < top_k {
+                filled += 1;
+            }
+        }
     }
-    for (_, weight) in &mut exps {
+
+    let max_val = selected_out[0].1;
+    let mut sum = 0.0_f32;
+    for (_, val) in selected_out.iter_mut() {
+        let e = (*val - max_val).exp();
+        *val = e;
+        sum += e;
+    }
+    for (_, weight) in selected_out.iter_mut() {
         *weight /= sum;
     }
-    Ok(exps)
+    Ok(())
+}
+
+/// Selects the top-`k` experts from router logits and computes normalized softmax gating weights.
+///
+/// # Errors
+///
+/// Fails closed with [`K3Error::CapabilityMismatch`] if `top_k == 0`, `router_logits.len() < top_k`,
+/// or any router logit is non-finite (`NaN` or `Inf`).
+pub fn route_topk_experts(
+    router_logits: &[f32],
+    top_k: usize,
+) -> Result<Vec<(usize, f32)>, K3Error> {
+    let mut selected = vec![(0_usize, 0.0_f32); top_k];
+    route_topk_into(router_logits, top_k, &mut selected)?;
+    Ok(selected)
 }
 
 /// Selects the top-2 experts from router logits and computes normalized softmax gating weights.
@@ -186,6 +232,8 @@ pub struct MistralRecipe {
     pub num_experts: Option<usize>,
     /// Number of active experts routed per token (e.g. 2 for Mixtral).
     pub num_experts_per_tok: Option<usize>,
+    /// Target worker partitions for row-parallel `M = 1` decode GEMV (`0` = auto thread count).
+    pub worker_partitions: usize,
 }
 
 impl Default for MistralRecipe {
@@ -213,6 +261,7 @@ impl MistralRecipe {
             sliding_window: Some(4096),
             num_experts: None,
             num_experts_per_tok: None,
+            worker_partitions: 0,
         }
     }
 
@@ -234,6 +283,7 @@ impl MistralRecipe {
             sliding_window: None,
             num_experts: None,
             num_experts_per_tok: None,
+            worker_partitions: 0,
         }
     }
 
@@ -255,6 +305,7 @@ impl MistralRecipe {
             sliding_window: Some(4096),
             num_experts: Some(8),
             num_experts_per_tok: Some(2),
+            worker_partitions: 0,
         }
     }
 
@@ -278,6 +329,44 @@ impl MistralRecipe {
     pub fn with_rope_scaling(mut self, scaling: Option<RopeScalingConfig>) -> Self {
         self.rope_scaling = scaling;
         self
+    }
+
+    /// Configures row-parallel `M = 1` decode GEMV worker partition count (`0` = auto).
+    #[must_use]
+    pub const fn with_worker_partitions(mut self, partitions: usize) -> Self {
+        self.worker_partitions = partitions;
+        self
+    }
+
+    fn effective_worker_partitions(&self) -> usize {
+        if self.worker_partitions > 0 {
+            self.worker_partitions
+        } else {
+            #[cfg(miri)]
+            {
+                1
+            }
+            #[cfg(not(miri))]
+            {
+                rayon::current_num_threads().max(1)
+            }
+        }
+    }
+
+    /// Returns a conservative `128-byte`-aligned [`ScratchWorkspace`] capacity (in bytes) sufficient
+    /// for zero-allocation single-token decode up to `max_seq_len`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::CapabilityMismatch`] if recipe geometry is invalid.
+    pub fn estimate_decode_scratch_bytes(&self, max_seq_len: usize) -> Result<usize, K3Error> {
+        let geom = self.effective_geometry()?;
+        let partitions = self.effective_worker_partitions();
+        Ok(required_decode_scratch_bytes(
+            geom,
+            max_seq_len.max(1),
+            partitions,
+        ))
     }
 
     /// Hydrates a [`MistralRecipe`] from parsed GGUF [`ModelMetadata`] and tensor descriptors.
@@ -383,67 +472,60 @@ impl MistralRecipe {
     ) -> Result<(), K3Error> {
         let geom = self.effective_geometry()?;
         cache.bind_weights(weights)?;
+        let keys = cache.ensure_layer_keys(geom.num_layers, geom.moe.map_or(0, |(n, _)| n));
         let _ = cache.get_or_decode_norm(weights, "output_norm.weight", geom.hidden_dim)?;
 
-        for layer in 0..geom.num_layers {
-            let _ = cache.get_or_decode_norm(
-                weights,
-                &format!("blk.{layer}.attn_norm.weight"),
-                geom.hidden_dim,
-            )?;
+        for layer_keys in keys.iter() {
+            let _ = cache.get_or_decode_norm(weights, &layer_keys.attn_norm, geom.hidden_dim)?;
             let _ = cache.get_or_repack_dense(
                 weights,
-                &format!("blk.{layer}.attn_q.weight"),
+                &layer_keys.attn_q,
                 geom.total_q,
                 geom.hidden_dim,
             )?;
             let _ = cache.get_or_repack_dense(
                 weights,
-                &format!("blk.{layer}.attn_k.weight"),
+                &layer_keys.attn_k,
                 geom.total_kv,
                 geom.hidden_dim,
             )?;
             let _ = cache.get_or_repack_dense(
                 weights,
-                &format!("blk.{layer}.attn_v.weight"),
+                &layer_keys.attn_v,
                 geom.total_kv,
                 geom.hidden_dim,
             )?;
             let _ = cache.get_or_repack_dense(
                 weights,
-                &format!("blk.{layer}.attn_output.weight"),
+                &layer_keys.attn_output,
                 geom.hidden_dim,
                 geom.total_q,
             )?;
-            let _ = cache.get_or_decode_norm(
-                weights,
-                &format!("blk.{layer}.ffn_norm.weight"),
-                geom.hidden_dim,
-            )?;
+            let _ = cache.get_or_decode_norm(weights, &layer_keys.ffn_norm, geom.hidden_dim)?;
 
             if let Some((n_exp, _top_k)) = geom.moe {
                 let _ = cache.get_or_repack_dense(
                     weights,
-                    &format!("blk.{layer}.ffn_gate_inp.weight"),
+                    &layer_keys.ffn_gate_inp,
                     n_exp,
                     geom.hidden_dim,
                 )?;
             } else {
                 let _ = cache.get_or_repack_dense(
                     weights,
-                    &format!("blk.{layer}.ffn_gate.weight"),
+                    &layer_keys.ffn_gate,
                     geom.ffn_dim,
                     geom.hidden_dim,
                 )?;
                 let _ = cache.get_or_repack_dense(
                     weights,
-                    &format!("blk.{layer}.ffn_up.weight"),
+                    &layer_keys.ffn_up,
                     geom.ffn_dim,
                     geom.hidden_dim,
                 )?;
                 let _ = cache.get_or_repack_dense(
                     weights,
-                    &format!("blk.{layer}.ffn_down.weight"),
+                    &layer_keys.ffn_down,
                     geom.hidden_dim,
                     geom.ffn_dim,
                 )?;
@@ -514,7 +596,13 @@ impl MistralRecipe {
                         reason: "prefill missing final token hidden state for logit projection"
                             .to_owned(),
                     })?;
-            project_lm_head(final_hidden, geom, ctx.logits_mut(), weights)?;
+            project_lm_head_parallel(
+                final_hidden,
+                geom,
+                ctx.logits_mut(),
+                weights,
+                self.effective_worker_partitions(),
+            )?;
         }
         ctx.advance_position(prompt_len)?;
         Ok(())
@@ -522,10 +610,15 @@ impl MistralRecipe {
 
     /// Executes single-token decode step using a caller-owned [`MistralLayerCache`].
     ///
+    /// Allocates transient per-token and per-layer buffers strictly from a `128-byte`-aligned
+    /// [`ScratchWorkspace`] (using `ctx`'s attached workspace when provided, or reusing `cache`'s
+    /// internal workspace after step 0) and partitions dense, active-expert, and LM-head GEMVs
+    /// across worker partitions without heap allocation.
+    ///
     /// # Errors
     ///
-    /// Returns [`K3Error`] if no decode token is staged, context bounds are exceeded, or a tensor
-    /// fails validation.
+    /// Returns [`K3Error`] if no decode token is staged, context bounds are exceeded, scratch
+    /// capacity is insufficient, or a tensor fails validation.
     pub fn decode_step_with_cache(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -549,21 +642,51 @@ impl MistralRecipe {
                 max_context_tokens: ctx.n_ctx(),
             });
         }
+
         let geom = self.effective_geometry()?;
-        let kv_geom = ctx.kv_geometry();
-        let mut act_scratch = MistralActScratch::new();
-        let hidden = self.execute_real_token_step_with_cache(
-            geom,
-            token,
-            pos,
-            seq_len,
-            ctx.kv_cache_mut(),
-            kv_geom,
-            weights,
-            cache,
-            &mut act_scratch,
-        )?;
-        project_lm_head(&hidden, geom, ctx.logits_mut(), weights)?;
+        let kv_geom_override = ctx.kv_geometry();
+        let partitions = self.effective_worker_partitions();
+        let layer_keys = cache.ensure_layer_keys(geom.num_layers, geom.moe.map_or(0, |(n, _)| n));
+
+        let mut owned_ws = if ctx.scratch().is_some() {
+            None
+        } else {
+            let req_bytes = required_decode_scratch_bytes(geom, seq_len.max(256), partitions);
+            Some(cache.take_decode_scratch(req_bytes)?)
+        };
+
+        let (logits_buf, kv_buf, scratch_opt) = ctx.buffers_and_scratch_mut();
+        let exec_res = {
+            let workspace = match scratch_opt {
+                Some(ws) => ws,
+                None => owned_ws
+                    .as_mut()
+                    .ok_or_else(|| K3Error::CapabilityMismatch {
+                        architecture: self.architecture_id().to_owned(),
+                        reason: "decode scratch workspace unavailable".to_owned(),
+                    })?,
+            };
+            self.execute_decode_with_workspace(
+                DecodeStepParams {
+                    geom,
+                    token,
+                    pos,
+                    seq_len,
+                    kv_geom_override,
+                    partitions,
+                },
+                logits_buf,
+                kv_buf,
+                workspace,
+                weights,
+                cache,
+                &layer_keys,
+            )
+        };
+        if let Some(ws) = owned_ws {
+            cache.restore_decode_scratch(ws);
+        }
+        exec_res?;
         ctx.advance_position(1)?;
         Ok(())
     }
@@ -736,96 +859,121 @@ impl MistralRecipe {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "internal single-token step coordinates geometry, KV cache, weights, and layer cache"
+        reason = "coordinates pre-allocated scratch workspace, KV view, weights, and cached layer keys"
     )]
-    fn execute_real_token_step_with_cache(
+    fn execute_decode_with_workspace(
         &self,
-        geom: MistralGeometry,
-        token_id: u32,
-        pos: usize,
-        seq_len: usize,
+        params: DecodeStepParams,
+        logits: &mut [f32],
         kv_cache: &mut [f32],
-        kv_geom_override: Option<KvGeometry>,
+        workspace: &mut ScratchWorkspace,
         weights: &dyn ModelWeights,
         cache: &mut MistralLayerCache,
-        act_scratch: &mut MistralActScratch,
-    ) -> Result<Vec<f32>, K3Error> {
-        let mut hidden = embed_real_token(token_id, geom.hidden_dim, geom.vocab_size, weights)?;
-        let inv_freq = rope_inv_freq_compat(
-            geom.head_dim,
-            geom.rope_theta,
+        layer_keys: &[LayerTensorKeys],
+    ) -> Result<(), K3Error> {
+        let mut cp = workspace.checkpoint();
+        let scope = cp.workspace().scope();
+        let inv_freq = scope.alloc_f32(params.geom.head_dim / 2)?;
+        let mut bufs = LayerStepBuffers::new_in_scope(params.geom, params.seq_len, &scope)?;
+        let max_proj_cols = params
+            .geom
+            .hidden_dim
+            .max(params.geom.total_q)
+            .max(params.geom.ffn_dim);
+        let mut gemv_pool =
+            DecodeGemvScratch::new_in_scope(&scope, max_proj_cols, params.partitions)?;
+
+        embed_real_token_into(params.token, bufs.hidden, params.geom.vocab_size, weights)?;
+        fill_rope_inv_freq_compat(
+            params.geom.head_dim,
+            params.geom.rope_theta,
             self.rope_scaling.as_ref(),
-            seq_len,
+            params.seq_len,
+            inv_freq,
         )?;
 
-        let mut kv_view = build_real_kv_view(geom, seq_len, kv_cache, kv_geom_override)?;
-        let mut bufs = LayerStepBuffers::new(geom);
+        let mut kv_view = build_real_kv_view(
+            params.geom,
+            params.seq_len,
+            kv_cache,
+            params.kv_geom_override,
+        )?;
 
         #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
-        let attn_scale = 1.0_f32 / (geom.head_dim as f32).sqrt();
+        let attn_scale = 1.0_f32 / (params.geom.head_dim as f32).sqrt();
         let step_ctx = CachedLayerStepCtx {
-            geom,
-            pos,
+            geom: params.geom,
+            pos: params.pos,
             attn_scale,
-            inv_freq: &inv_freq,
+            inv_freq,
             weights,
+            partitions: params.partitions,
         };
 
-        for layer in 0..geom.num_layers {
+        for (layer, keys) in layer_keys.iter().enumerate() {
             execute_layer_attention_cached(
                 &step_ctx,
                 layer,
+                keys,
                 &mut kv_view,
                 &mut bufs,
-                &mut hidden,
                 cache,
-                act_scratch,
+                &scope,
+                &mut gemv_pool,
             )?;
 
             apply_layer_rmsnorm_cached(
-                &format!("blk.{layer}.ffn_norm.weight"),
-                &hidden,
-                &mut bufs.ffn_norm,
-                geom.rms_eps,
+                &keys.ffn_norm,
+                bufs.hidden,
+                bufs.ffn_norm,
+                params.geom.rms_eps,
                 weights,
                 cache,
             )?;
 
-            if let Some((n_exp, top_k)) = geom.moe {
+            if let Some((n_exp, top_k)) = params.geom.moe {
                 execute_moe_ffn_cached(
                     layer,
-                    geom,
+                    keys,
+                    params.geom,
                     n_exp,
                     top_k,
-                    &bufs.ffn_norm,
-                    &mut hidden,
+                    &mut bufs,
                     weights,
                     cache,
+                    &scope,
+                    &mut gemv_pool,
+                    params.partitions,
                 )?;
             } else {
                 execute_dense_ffn_cached(
-                    layer,
-                    geom.ffn_dim,
-                    &bufs.ffn_norm,
-                    &mut hidden,
+                    keys,
+                    &mut bufs,
                     weights,
                     cache,
-                    act_scratch,
+                    &scope,
+                    &mut gemv_pool,
+                    params.partitions,
                 )?;
             }
         }
 
-        let mut final_hidden = vec![0.0_f32; geom.hidden_dim];
         apply_layer_rmsnorm_cached(
             "output_norm.weight",
-            &hidden,
-            &mut final_hidden,
-            geom.rms_eps,
+            bufs.hidden,
+            bufs.final_hidden,
+            params.geom.rms_eps,
             weights,
             cache,
         )?;
 
-        Ok(final_hidden)
+        project_lm_head_parallel(
+            bufs.final_hidden,
+            params.geom,
+            logits,
+            weights,
+            params.partitions,
+        )
     }
 
     /// Executes deterministic synthetic token step ONLY when `weights.tensor_count() == 0`
@@ -835,11 +983,10 @@ impl MistralRecipe {
         token_id: u32,
         pos: usize,
         kv_cache: &mut [f32],
-    ) -> Result<Vec<f32>, K3Error> {
+    ) -> Result<f32, K3Error> {
         let hidden_dim = self.hidden_dim;
         #[expect(clippy::cast_precision_loss, reason = "token_id modulo 17 fits in f32")]
         let base_val = ((token_id % 17) as f32) * 0.1 + 0.5;
-        let mut hidden = vec![base_val; hidden_dim];
         let total_kv = self.n_heads_kv * self.head_dim;
         let inv_freq = rope_inv_freq_compat(
             self.head_dim,
@@ -862,10 +1009,7 @@ impl MistralRecipe {
                 kv_cache[v_off..v_off + total_kv].copy_from_slice(&v_vec);
             }
         }
-        if !hidden.is_empty() {
-            hidden[0] += 0.01;
-        }
-        Ok(hidden)
+        Ok(if hidden_dim > 0 { base_val + 0.01 } else { 0.0 })
     }
 }
 
@@ -906,11 +1050,12 @@ impl ArchRecipe for MistralRecipe {
         let prompt_tokens = ctx.prompt_tokens().to_vec();
         let prompt_len = prompt_tokens.len();
         let start_pos = ctx.position();
-        let mut last_hidden = Vec::new();
+        let mut last_hidden_first = 0.0_f32;
         {
             let kv_cache = ctx.kv_cache_mut();
             for (i, &tok) in prompt_tokens.iter().enumerate() {
-                last_hidden = self.execute_synthetic_token_step(tok, start_pos + i, kv_cache)?;
+                last_hidden_first =
+                    self.execute_synthetic_token_step(tok, start_pos + i, kv_cache)?;
             }
         }
         let compute_logits = ctx.compute_logits();
@@ -919,7 +1064,7 @@ impl ArchRecipe for MistralRecipe {
             let logits = ctx.logits_mut();
             if !logits.is_empty() {
                 logits.fill(0.0);
-                let bias = (last_hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
+                let bias = (last_hidden_first.abs() % 0.25) * 0.01;
                 let target_slot = if logits.len() > 9 { 9 } else { 0 };
                 logits[target_slot] = 1.0 + bias;
             }
@@ -946,12 +1091,12 @@ impl ArchRecipe for MistralRecipe {
             })?;
 
         let pos = ctx.position();
-        let hidden = self.execute_synthetic_token_step(token, pos, ctx.kv_cache_mut())?;
+        let first_hidden = self.execute_synthetic_token_step(token, pos, ctx.kv_cache_mut())?;
         ctx.advance_position(1)?;
         let logits = ctx.logits_mut();
         if !logits.is_empty() {
             logits.fill(0.0);
-            let bias = (hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
+            let bias = (first_hidden.abs() % 0.25) * 0.01;
             let next_slot = (usize::try_from(token).unwrap_or(0) + 1) % logits.len();
             logits[next_slot] = 2.0 + bias;
         }
@@ -1154,6 +1299,24 @@ fn read_positive_f32(gguf: &GgufFile<'_>, key: &str) -> Option<f32> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn embed_real_token_into(
+    token_id: u32,
+    out: &mut [f32],
+    vocab_size: usize,
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    let emb_tensor = weights.tensor("token_embd.weight")?;
+    let _ = resolve_2d_dims(&emb_tensor, vocab_size, out.len())?;
+    let row_idx = usize::try_from(token_id).map_err(|_| {
+        tensor_bounds_err(
+            &emb_tensor,
+            0,
+            &format!("token_id {token_id} overflows usize"),
+        )
+    })?;
+    dequantize_embedding_row(&emb_tensor, row_idx, out)
+}
+
 fn embed_real_tokens_batch(
     token_ids: &[u32],
     hidden_dim: usize,
@@ -1178,15 +1341,6 @@ fn embed_real_tokens_batch(
         dequantize_embedding_row(&emb_tensor, row_idx, dst)?;
     }
     Ok(hidden)
-}
-
-fn embed_real_token(
-    token_id: u32,
-    hidden_dim: usize,
-    vocab_size: usize,
-    weights: &dyn ModelWeights,
-) -> Result<Vec<f32>, K3Error> {
-    embed_real_tokens_batch(&[token_id], hidden_dim, vocab_size, weights)
 }
 
 fn build_real_kv_view(
@@ -1293,45 +1447,96 @@ fn apply_layer_rmsnorm_cached(
     apply_layer_rmsnorm_batch_cached(tensor_name, input, out, 1, input.len(), eps, weights, cache)
 }
 
+#[derive(Clone, Copy)]
+struct DecodeStepParams {
+    geom: MistralGeometry,
+    token: u32,
+    pos: usize,
+    seq_len: usize,
+    kv_geom_override: Option<KvGeometry>,
+    partitions: usize,
+}
+
+fn required_decode_scratch_bytes(
+    geom: MistralGeometry,
+    seq_len: usize,
+    partitions: usize,
+) -> usize {
+    let n_exp = geom.moe.map_or(0, |(n, _)| n);
+    let f32_elems = geom
+        .hidden_dim
+        .saturating_mul(6)
+        .saturating_add(geom.total_q.saturating_mul(2))
+        .saturating_add(geom.total_kv.saturating_mul(2))
+        .saturating_add(geom.ffn_dim.saturating_mul(3))
+        .saturating_add(geom.head_dim / 2)
+        .saturating_add(seq_len.max(1))
+        .saturating_add(n_exp);
+    #[cfg(feature = "with-kernels")]
+    let q8_view_bytes = {
+        let _ = partitions;
+        let per_layer_q8 =
+            jero_kernels_rvv::QuantizedActQ8View::scratch_bytes_for_row(geom.hidden_dim)
+                .saturating_mul(5)
+                .saturating_add(jero_kernels_rvv::QuantizedActQ8View::scratch_bytes_for_row(
+                    geom.total_q,
+                ))
+                .saturating_add(jero_kernels_rvv::QuantizedActQ8View::scratch_bytes_for_row(
+                    geom.ffn_dim,
+                ));
+        geom.num_layers.saturating_mul(per_layer_q8)
+    };
+    #[cfg(not(feature = "with-kernels"))]
+    let q8_view_bytes = {
+        let eff_parts = partitions.max(1);
+        let max_cols = geom.hidden_dim.max(geom.total_q).max(geom.ffn_dim);
+        eff_parts.saturating_mul(max_cols).saturating_mul(8)
+    };
+    f32_elems
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(q8_view_bytes)
+        .saturating_add(24 * SCRATCH_ALIGNMENT)
+}
+
 fn execute_dense_ffn_cached(
-    layer: usize,
-    ffn_dim: usize,
-    ffn_norm: &[f32],
-    hidden: &mut [f32],
+    keys: &LayerTensorKeys,
+    bufs: &mut LayerStepBuffers<'_>,
     weights: &dyn ModelWeights,
     cache: &mut MistralLayerCache,
-    act_scratch: &mut MistralActScratch,
+    scope: &ScratchScope<'_>,
+    gemv_pool: &mut DecodeGemvScratch<'_>,
+    partitions: usize,
 ) -> Result<(), K3Error> {
-    let mut gate = vec![0.0_f32; ffn_dim];
-    let mut up = vec![0.0_f32; ffn_dim];
-    let mut act = vec![0.0_f32; ffn_dim];
-    let mut down = vec![0.0_f32; hidden.len()];
+    cache.matvec_dense_decode_pooled(
+        weights,
+        &keys.ffn_gate,
+        bufs.gate,
+        bufs.ffn_norm,
+        scope,
+        Some(gemv_pool),
+        partitions,
+    )?;
+    cache.matvec_dense_decode_pooled(
+        weights,
+        &keys.ffn_up,
+        bufs.up,
+        bufs.ffn_norm,
+        scope,
+        Some(gemv_pool),
+        partitions,
+    )?;
+    swiglu_compat(bufs.act, bufs.gate, bufs.up)?;
+    cache.matvec_dense_decode_pooled(
+        weights,
+        &keys.ffn_down,
+        bufs.down,
+        bufs.act,
+        scope,
+        Some(gemv_pool),
+        partitions,
+    )?;
 
-    act_scratch.prepare_row(ffn_norm)?;
-    cache.matvec_dense_cached(
-        weights,
-        &format!("blk.{layer}.ffn_gate.weight"),
-        &mut gate,
-        ffn_norm,
-        Some(act_scratch),
-    )?;
-    cache.matvec_dense_cached(
-        weights,
-        &format!("blk.{layer}.ffn_up.weight"),
-        &mut up,
-        ffn_norm,
-        Some(act_scratch),
-    )?;
-    swiglu_compat(&mut act, &gate, &up)?;
-    cache.matvec_dense_cached(
-        weights,
-        &format!("blk.{layer}.ffn_down.weight"),
-        &mut down,
-        &act,
-        None,
-    )?;
-
-    for (h, &d) in hidden.iter_mut().zip(&down) {
+    for (h, &d) in bufs.hidden.iter_mut().zip(bufs.down.iter()) {
         *h += d;
     }
     Ok(())
@@ -1339,36 +1544,47 @@ fn execute_dense_ffn_cached(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "coordinates layer geometry, top-k expert slicing, and cached router dispatch"
+    reason = "coordinates layer keys, zero-alloc top-k expert routing, zero-copy slicing, and row-parallel GEMV"
 )]
 fn execute_moe_ffn_cached(
     layer: usize,
+    keys: &LayerTensorKeys,
     geom: MistralGeometry,
     n_exp: usize,
     top_k: usize,
-    ffn_norm: &[f32],
-    hidden: &mut [f32],
+    bufs: &mut LayerStepBuffers<'_>,
     weights: &dyn ModelWeights,
     cache: &mut MistralLayerCache,
+    scope: &ScratchScope<'_>,
+    gemv_pool: &mut DecodeGemvScratch<'_>,
+    partitions: usize,
 ) -> Result<(), K3Error> {
-    let mut router_logits = vec![0.0_f32; n_exp];
-    cache.matvec_dense_cached(
+    const MAX_STACK_TOP_K: usize = 32;
+    cache.matvec_dense_decode_pooled(
         weights,
-        &format!("blk.{layer}.ffn_gate_inp.weight"),
-        &mut router_logits,
-        ffn_norm,
-        None,
+        &keys.ffn_gate_inp,
+        bufs.router_logits,
+        bufs.ffn_norm,
+        scope,
+        Some(gemv_pool),
+        partitions,
     )?;
-    let selected = route_topk_experts(&router_logits, top_k)?;
 
-    let mut gate = vec![0.0_f32; geom.ffn_dim];
-    let mut up = vec![0.0_f32; geom.ffn_dim];
-    let mut act = vec![0.0_f32; geom.ffn_dim];
-    let mut down = vec![0.0_f32; geom.hidden_dim];
+    let mut stack_top = [(0_usize, 0.0_f32); MAX_STACK_TOP_K];
+    let heap_top;
+    let selected: &[(usize, f32)] = if top_k <= MAX_STACK_TOP_K {
+        let slice = &mut stack_top[..top_k];
+        route_topk_into(bufs.router_logits, top_k, slice)?;
+        slice
+    } else {
+        heap_top = route_topk_experts(bufs.router_logits, top_k)?;
+        &heap_top
+    };
 
-    for (expert_idx, gate_weight) in selected {
-        let g_w = cache.slice_expert_projection(
+    for &(expert_idx, gate_weight) in selected {
+        let g_w = cache.slice_expert_projection_by_keys(
             weights,
+            keys,
             layer,
             "gate",
             expert_idx,
@@ -1376,8 +1592,9 @@ fn execute_moe_ffn_cached(
             geom.ffn_dim,
             geom.hidden_dim,
         )?;
-        let u_w = cache.slice_expert_projection(
+        let u_w = cache.slice_expert_projection_by_keys(
             weights,
+            keys,
             layer,
             "up",
             expert_idx,
@@ -1385,8 +1602,9 @@ fn execute_moe_ffn_cached(
             geom.ffn_dim,
             geom.hidden_dim,
         )?;
-        let d_w = cache.slice_expert_projection(
+        let d_w = cache.slice_expert_projection_by_keys(
             weights,
+            keys,
             layer,
             "down",
             expert_idx,
@@ -1395,23 +1613,24 @@ fn execute_moe_ffn_cached(
             geom.ffn_dim,
         )?;
 
-        matvec_tensor(&mut gate, &g_w, ffn_norm)?;
-        matvec_tensor(&mut up, &u_w, ffn_norm)?;
-        swiglu_compat(&mut act, &gate, &up)?;
-        matvec_tensor(&mut down, &d_w, &act)?;
+        matvec_tensor_rows_parallel(bufs.gate, &g_w, bufs.ffn_norm, partitions)?;
+        matvec_tensor_rows_parallel(bufs.up, &u_w, bufs.ffn_norm, partitions)?;
+        swiglu_compat(bufs.act, bufs.gate, bufs.up)?;
+        matvec_tensor_rows_parallel(bufs.down, &d_w, bufs.act, partitions)?;
 
-        for (h, &delta) in hidden.iter_mut().zip(&down) {
+        for (h, &delta) in bufs.hidden.iter_mut().zip(bufs.down.iter()) {
             *h += gate_weight * delta;
         }
     }
     Ok(())
 }
 
-fn project_lm_head(
+fn project_lm_head_parallel(
     final_hidden: &[f32],
     geom: MistralGeometry,
     logits: &mut [f32],
     weights: &dyn ModelWeights,
+    partitions: usize,
 ) -> Result<(), K3Error> {
     let head = if weights.contains_tensor("output.weight") {
         weights.tensor("output.weight")?
@@ -1444,7 +1663,7 @@ fn project_lm_head(
         });
     }
 
-    matvec_tensor(&mut logits[..vocab], &head, final_hidden)?;
+    matvec_tensor_rows_parallel(&mut logits[..vocab], &head, final_hidden, partitions)?;
     if logits.len() > vocab {
         logits[vocab..].fill(0.0);
     }
@@ -1478,27 +1697,48 @@ fn infer_descriptor_rows(desc: &TensorDescriptor, expected_cols: usize) -> Optio
     }
 }
 
-struct LayerStepBuffers {
-    attn_norm: Vec<f32>,
-    q_vec: Vec<f32>,
-    k_vec: Vec<f32>,
-    v_vec: Vec<f32>,
-    attn_out: Vec<f32>,
-    o_proj: Vec<f32>,
-    ffn_norm: Vec<f32>,
+struct LayerStepBuffers<'a> {
+    hidden: &'a mut [f32],
+    final_hidden: &'a mut [f32],
+    attn_norm: &'a mut [f32],
+    q_vec: &'a mut [f32],
+    k_vec: &'a mut [f32],
+    v_vec: &'a mut [f32],
+    attn_out: &'a mut [f32],
+    o_proj: &'a mut [f32],
+    ffn_norm: &'a mut [f32],
+    gate: &'a mut [f32],
+    up: &'a mut [f32],
+    act: &'a mut [f32],
+    down: &'a mut [f32],
+    scores: &'a mut [f32],
+    router_logits: &'a mut [f32],
 }
 
-impl LayerStepBuffers {
-    fn new(geom: MistralGeometry) -> Self {
-        Self {
-            attn_norm: vec![0.0_f32; geom.hidden_dim],
-            q_vec: vec![0.0_f32; geom.total_q],
-            k_vec: vec![0.0_f32; geom.total_kv],
-            v_vec: vec![0.0_f32; geom.total_kv],
-            attn_out: vec![0.0_f32; geom.total_q],
-            o_proj: vec![0.0_f32; geom.hidden_dim],
-            ffn_norm: vec![0.0_f32; geom.hidden_dim],
-        }
+impl<'a> LayerStepBuffers<'a> {
+    fn new_in_scope(
+        geom: MistralGeometry,
+        seq_len: usize,
+        scope: &'a ScratchScope<'_>,
+    ) -> Result<Self, K3Error> {
+        let n_exp = geom.moe.map_or(0, |(n, _)| n);
+        Ok(Self {
+            hidden: scope.alloc_f32(geom.hidden_dim)?,
+            final_hidden: scope.alloc_f32(geom.hidden_dim)?,
+            attn_norm: scope.alloc_f32(geom.hidden_dim)?,
+            q_vec: scope.alloc_f32(geom.total_q)?,
+            k_vec: scope.alloc_f32(geom.total_kv)?,
+            v_vec: scope.alloc_f32(geom.total_kv)?,
+            attn_out: scope.alloc_f32(geom.total_q)?,
+            o_proj: scope.alloc_f32(geom.hidden_dim)?,
+            ffn_norm: scope.alloc_f32(geom.hidden_dim)?,
+            gate: scope.alloc_f32(geom.ffn_dim)?,
+            up: scope.alloc_f32(geom.ffn_dim)?,
+            act: scope.alloc_f32(geom.ffn_dim)?,
+            down: scope.alloc_f32(geom.hidden_dim)?,
+            scores: scope.alloc_f32(seq_len.max(1))?,
+            router_logits: scope.alloc_f32(n_exp)?,
+        })
     }
 }
 
@@ -1508,63 +1748,74 @@ struct CachedLayerStepCtx<'a> {
     attn_scale: f32,
     inv_freq: &'a [f32],
     weights: &'a dyn ModelWeights,
+    partitions: usize,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "attention stage reads pre-built layer keys, KV cache, reusable scratch slices, and gemv pool"
+)]
 fn execute_layer_attention_cached(
     ctx: &CachedLayerStepCtx<'_>,
     layer: usize,
+    keys: &LayerTensorKeys,
     kv_view: &mut KvCacheView<'_>,
-    bufs: &mut LayerStepBuffers,
-    hidden: &mut [f32],
+    bufs: &mut LayerStepBuffers<'_>,
     cache: &mut MistralLayerCache,
-    act_scratch: &mut MistralActScratch,
+    scope: &ScratchScope<'_>,
+    gemv_pool: &mut DecodeGemvScratch<'_>,
 ) -> Result<(), K3Error> {
     apply_layer_rmsnorm_cached(
-        &format!("blk.{layer}.attn_norm.weight"),
-        hidden,
-        &mut bufs.attn_norm,
+        &keys.attn_norm,
+        bufs.hidden,
+        bufs.attn_norm,
         ctx.geom.rms_eps,
         ctx.weights,
         cache,
     )?;
 
-    act_scratch.prepare_row(&bufs.attn_norm)?;
-    cache.matvec_dense_cached(
+    cache.matvec_dense_decode_pooled(
         ctx.weights,
-        &format!("blk.{layer}.attn_q.weight"),
-        &mut bufs.q_vec,
-        &bufs.attn_norm,
-        Some(act_scratch),
+        &keys.attn_q,
+        bufs.q_vec,
+        bufs.attn_norm,
+        scope,
+        Some(gemv_pool),
+        ctx.partitions,
     )?;
-    cache.matvec_dense_cached(
+    cache.matvec_dense_decode_pooled(
         ctx.weights,
-        &format!("blk.{layer}.attn_k.weight"),
-        &mut bufs.k_vec,
-        &bufs.attn_norm,
-        Some(act_scratch),
+        &keys.attn_k,
+        bufs.k_vec,
+        bufs.attn_norm,
+        scope,
+        Some(gemv_pool),
+        ctx.partitions,
     )?;
-    cache.matvec_dense_cached(
+    cache.matvec_dense_decode_pooled(
         ctx.weights,
-        &format!("blk.{layer}.attn_v.weight"),
-        &mut bufs.v_vec,
-        &bufs.attn_norm,
-        Some(act_scratch),
+        &keys.attn_v,
+        bufs.v_vec,
+        bufs.attn_norm,
+        scope,
+        Some(gemv_pool),
+        ctx.partitions,
     )?;
 
-    apply_norm_rope_inplace(&mut bufs.q_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
-    apply_norm_rope_inplace(&mut bufs.k_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
+    apply_norm_rope_inplace(bufs.q_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
+    apply_norm_rope_inplace(bufs.k_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
 
     {
         let (k_slot, v_slot) = kv_view.write_pos_range(layer, ctx.pos)?;
-        k_slot.copy_from_slice(&bufs.k_vec);
-        v_slot.copy_from_slice(&bufs.v_vec);
+        k_slot.copy_from_slice(bufs.k_vec);
+        v_slot.copy_from_slice(bufs.v_vec);
     }
     let valid_range = kv_view.valid_token_range(ctx.pos + 1)?;
     let valid_len = valid_range.len();
     let (k_valid, v_valid) = kv_view.valid_kv_range(layer, ctx.pos + 1)?;
-    gqa_attention_compat(
-        &mut bufs.attn_out,
-        &bufs.q_vec,
+    gqa_attention_with_scratch_compat(
+        bufs.attn_out,
+        bufs.q_vec,
         k_valid,
         v_valid,
         ctx.geom.n_heads_q,
@@ -1572,16 +1823,19 @@ fn execute_layer_attention_cached(
         ctx.geom.head_dim,
         valid_len,
         ctx.attn_scale,
+        &mut bufs.scores[..valid_len],
     )?;
 
-    cache.matvec_dense_cached(
+    cache.matvec_dense_decode_pooled(
         ctx.weights,
-        &format!("blk.{layer}.attn_output.weight"),
-        &mut bufs.o_proj,
-        &bufs.attn_out,
-        None,
+        &keys.attn_output,
+        bufs.o_proj,
+        bufs.attn_out,
+        scope,
+        Some(gemv_pool),
+        ctx.partitions,
     )?;
-    for (h, &delta) in hidden.iter_mut().zip(&bufs.o_proj) {
+    for (h, &delta) in bufs.hidden.iter_mut().zip(bufs.o_proj.iter()) {
         *h += delta;
     }
     Ok(())
@@ -2148,12 +2402,14 @@ mod tests {
         }
 
         fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
-            *self
-                .tensor_calls
-                .lock()
-                .unwrap()
-                .entry(name.to_owned())
-                .or_insert(0) += 1;
+            {
+                let mut calls = self.tensor_calls.lock().unwrap();
+                if let Some(count) = calls.get_mut(name) {
+                    *count += 1;
+                } else {
+                    calls.insert(name.to_owned(), 1);
+                }
+            }
             let t = self
                 .tensors
                 .get(name)
@@ -2409,5 +2665,131 @@ mod tests {
             assert!((lb - ls).abs() < 1e-4, "batch={lb} seq={ls}");
             assert!((lfb - ls).abs() < 1e-4, "fallback={lfb} seq={ls}");
         }
+    }
+
+    fn assert_logits_partition_consistent(baseline: &mut Vec<f32>, logits: &[f32], label: &str) {
+        assert!(logits.iter().all(|v| v.is_finite()), "{label} non-finite");
+        if baseline.is_empty() {
+            baseline.extend_from_slice(logits);
+            return;
+        }
+        for (idx, (&actual, &expected)) in logits.iter().zip(baseline.iter()).enumerate() {
+            #[cfg(not(miri))]
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{label} idx={idx} bit mismatch"
+            );
+            // Miri randomizes host transcendental f32 ULPs across separate calls (`exp`/`sin`/`cos`).
+            #[cfg(miri)]
+            assert!(
+                (actual - expected).abs() <= 1e-4,
+                "{label} idx={idx} miri diff actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    fn assert_wave4_mixtral_partition_determinism_miri(
+        recipe_base: MistralRecipe,
+        mut moe_weights: RecipeTestWeights,
+    ) {
+        let h = recipe_base.hidden_dim;
+        let mut moe_recipe = recipe_base.with_experts(4, 2);
+        moe_recipe.architecture = "mixtral";
+        let mut gate_inp = vec![0.0_f32; 4 * h];
+        gate_inp[0] = 5.0;
+        gate_inp[h] = 3.0;
+        moe_weights.insert_f32("blk.0.ffn_gate_inp.weight", vec![h, 4], &gate_inp);
+        for proj in ["gate", "up", "down"] {
+            let vals = pseudo_matrix(h, h, 80);
+            let mut stacked = Vec::new();
+            for _ in 0..4 {
+                stacked.extend_from_slice(&vals);
+            }
+            moe_weights.insert_f32(
+                &format!("blk.0.ffn_{proj}_exps.weight"),
+                vec![h, h, 4],
+                &stacked,
+            );
+        }
+        let moe_scratch_bytes = moe_recipe
+            .estimate_decode_scratch_bytes(4)
+            .expect("moe scratch");
+        let mut moe_ws = ScratchWorkspace::new(moe_scratch_bytes).expect("moe ws");
+        let mut cache = MistralLayerCache::new();
+        let mut baseline_moe = Vec::new();
+        let parts_list: &[usize] = if cfg!(miri) { &[1, 4] } else { &[1, 4, 8] };
+        for &parts in parts_list {
+            let r = moe_recipe.clone().with_worker_partitions(parts);
+            let mut kv = vec![0.0_f32; 2 * 4 * r.n_heads_kv * r.head_dim];
+            let mut logits = vec![0.0_f32; r.vocab_size];
+            let mut ctx = ExecutionContext::new(&[], 4, &mut logits, &mut kv)
+                .expect("ctx")
+                .with_scratch(&mut moe_ws);
+            ctx.prepare_decode(1).unwrap();
+            r.decode_step_with_cache(&mut ctx, &moe_weights, &mut cache)
+                .expect("moe decode");
+            assert_logits_partition_consistent(&mut baseline_moe, &logits, "mixtral decode");
+        }
+    }
+
+    #[test]
+    fn test_wave4_zero_alloc_route_topk_and_partition_determinism_miri() {
+        let router_logits = [0.2_f32, 3.5, -1.0, 3.5];
+        let vec_top = route_topk_experts(&router_logits, 2).expect("allocating topk");
+        let mut stack_top = [(0_usize, 0.0_f32); 2];
+        route_topk_into(&router_logits, 2, &mut stack_top).expect("zero-alloc topk");
+        assert_eq!(stack_top[0].0, 1);
+        assert_eq!(stack_top[1].0, 3);
+        for (a, b) in stack_top.iter().zip(&vec_top) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.to_bits(), b.1.to_bits());
+        }
+        assert!(route_topk_into(&[0.1, f32::NAN], 2, &mut stack_top).is_err());
+
+        let mut recipe_base = MistralRecipe::new_mistral3().with_sliding_window(None);
+        recipe_base.num_layers = 1;
+        recipe_base.hidden_dim = 8;
+        recipe_base.ffn_dim = 8;
+        recipe_base.n_heads_q = 2;
+        recipe_base.n_heads_kv = 1;
+        recipe_base.head_dim = 4;
+        recipe_base.vocab_size = 16;
+        let base_weights = build_compact_dense_weights(&recipe_base, false);
+        let req_bytes = recipe_base
+            .estimate_decode_scratch_bytes(4)
+            .expect("scratch estimate");
+
+        let mut tiny_kv = vec![0.0_f32; 2 * 4 * recipe_base.n_heads_kv * recipe_base.head_dim];
+        let mut tiny_logits = vec![0.0_f32; recipe_base.vocab_size];
+        let mut tiny_ws = ScratchWorkspace::new(64).expect("tiny scratch");
+        let mut tiny_cache = MistralLayerCache::new();
+        let mut tiny_ctx = ExecutionContext::new(&[0], 4, &mut tiny_logits, &mut tiny_kv)
+            .expect("ctx")
+            .with_scratch(&mut tiny_ws);
+        tiny_ctx.prepare_decode(1).unwrap();
+        assert!(matches!(
+            recipe_base.decode_step_with_cache(&mut tiny_ctx, &base_weights, &mut tiny_cache),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        let mut ws = ScratchWorkspace::new(req_bytes).expect("decode scratch");
+        let mut cache = MistralLayerCache::new();
+        let mut baseline_dense = Vec::new();
+        let parts_list: &[usize] = if cfg!(miri) { &[1, 4] } else { &[1, 4, 8] };
+        for &parts in parts_list {
+            let r = recipe_base.clone().with_worker_partitions(parts);
+            let mut kv = vec![0.0_f32; 2 * 4 * r.n_heads_kv * r.head_dim];
+            let mut logits = vec![0.0_f32; r.vocab_size];
+            let mut ctx = ExecutionContext::new(&[], 4, &mut logits, &mut kv)
+                .expect("ctx")
+                .with_scratch(&mut ws);
+            ctx.prepare_decode(1).unwrap();
+            r.decode_step_with_cache(&mut ctx, &base_weights, &mut cache)
+                .expect("decode");
+            assert_logits_partition_consistent(&mut baseline_dense, &logits, "dense decode");
+        }
+        assert!(ws.peak_used_bytes() > 0 && ws.peak_used_bytes() <= ws.capacity_bytes());
+        assert_wave4_mixtral_partition_determinism_miri(recipe_base, base_weights);
     }
 }

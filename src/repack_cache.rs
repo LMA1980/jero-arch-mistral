@@ -12,16 +12,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(not(feature = "with-kernels"))]
 use jero_core::TensorShape;
-use jero_core::{K3Error, ModelWeights, QuantType, TensorView};
+use jero_core::{K3Error, ModelWeights, QuantType, ScratchScope, ScratchWorkspace, TensorView};
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight, gemm_repacked_rows};
+use jero_kernels_rvv::{QuantizedActQ8, QuantizedActQ8View, RepackedWeight, gemm_repacked_rows};
 
+#[cfg(feature = "with-kernels")]
+use crate::kernels_compat::for_each_row_partition;
 #[cfg(not(feature = "with-kernels"))]
 use crate::kernels_compat::{
-    bf16_to_f32_portable, decode_quant_row_portable, dot_f32_compat, f16_to_f32_portable,
+    aligned_partition_mid, bf16_to_f32_portable, decode_quant_row_portable, dot_f32_compat,
+    f16_to_f32_portable,
 };
 use crate::kernels_compat::{
-    decode_norm_weights, matmul_tensor, resolve_2d_dims, tensor_bounds_err,
+    decode_norm_weights, matmul_tensor, matvec_tensor_rows_parallel, resolve_2d_dims,
+    tensor_bounds_err,
 };
 
 /// Required payload alignment (`128` bytes) matching `X100` `RVV` / `A100` `IME` tiles.
@@ -442,6 +446,199 @@ impl PortableAlignedMatrix {
     fn gemv_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
         self.gemm_rows_f32(out, input, 1, 0..self.rows)
     }
+
+    fn gemv_rows_f32_parallel_in_scope(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        pool: Option<&mut DecodeGemvScratch<'_>>,
+        partitions: usize,
+    ) -> Result<(), K3Error> {
+        if out.len() != self.rows || input.len() != self.cols {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "CachedDenseProjection::gemv".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(out),
+                buffer_len: self.rows.saturating_mul(size_of::<f32>()),
+                reason: format!(
+                    "GEMV shape mismatch: out={}, input={}, expected rows={}, cols={}",
+                    out.len(),
+                    input.len(),
+                    self.rows,
+                    self.cols
+                ),
+            });
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+
+        let eff_parts = partitions.max(1).min(out.len());
+        let raw_pool_len =
+            eff_parts
+                .checked_mul(self.row_bytes)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "CachedDenseProjection::gemv".to_owned(),
+                    offset: 0,
+                    byte_len: usize::MAX,
+                    buffer_len: scope.remaining_bytes(),
+                    reason: "portable GEMV raw scratch size overflow".to_owned(),
+                })?;
+        let f32_pool_len =
+            eff_parts
+                .checked_mul(self.cols)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "CachedDenseProjection::gemv".to_owned(),
+                    offset: 0,
+                    byte_len: usize::MAX,
+                    buffer_len: scope.remaining_bytes(),
+                    reason: "portable GEMV f32 scratch size overflow".to_owned(),
+                })?;
+
+        let (raw_buf, f32_buf) = if let Some(p) = pool
+            && p.portable_raw.len() >= raw_pool_len
+            && p.portable_f32.len() >= f32_pool_len
+        {
+            (
+                &mut p.portable_raw[..raw_pool_len],
+                &mut p.portable_f32[..f32_pool_len],
+            )
+        } else {
+            (
+                scope.alloc_u8(raw_pool_len)?,
+                scope.alloc_f32(f32_pool_len)?,
+            )
+        };
+
+        Self::run_portable_partition(self, 0, out, input, raw_buf, f32_buf, eff_parts)
+    }
+
+    fn run_portable_partition(
+        mat: &Self,
+        row_start: usize,
+        out_slice: &mut [f32],
+        input: &[f32],
+        raw_scratch: &mut [u8],
+        f32_scratch: &mut [f32],
+        parts: usize,
+    ) -> Result<(), K3Error> {
+        if parts <= 1 || out_slice.len() <= 1 {
+            let row_raw = &mut raw_scratch[..mat.row_bytes];
+            let row_f32 = &mut f32_scratch[..mat.cols];
+            for (local_n, dst) in out_slice.iter_mut().enumerate() {
+                mat.decode_row_into(row_start + local_n, row_raw, row_f32)?;
+                *dst = dot_f32_compat(row_f32, input);
+            }
+            return Ok(());
+        }
+
+        let left_parts = parts / 2;
+        let right_parts = parts - left_parts;
+        let mid = aligned_partition_mid(out_slice.len(), left_parts, parts, 8);
+
+        let (out_l, out_r) = out_slice.split_at_mut(mid);
+        let (raw_l, raw_r) = raw_scratch.split_at_mut(left_parts * mat.row_bytes);
+        let (f32_l, f32_r) = f32_scratch.split_at_mut(left_parts * mat.cols);
+        #[cfg(miri)]
+        {
+            Self::run_portable_partition(mat, row_start, out_l, input, raw_l, f32_l, left_parts)?;
+            Self::run_portable_partition(
+                mat,
+                row_start + mid,
+                out_r,
+                input,
+                raw_r,
+                f32_r,
+                right_parts,
+            )
+        }
+        #[cfg(not(miri))]
+        {
+            let (lhs, rhs) = rayon::join(
+                || {
+                    Self::run_portable_partition(
+                        mat, row_start, out_l, input, raw_l, f32_l, left_parts,
+                    )
+                },
+                || {
+                    Self::run_portable_partition(
+                        mat,
+                        row_start + mid,
+                        out_r,
+                        input,
+                        raw_r,
+                        f32_r,
+                        right_parts,
+                    )
+                },
+            );
+            lhs?;
+            rhs
+        }
+    }
+}
+
+/// Reusable decode-step GEMV scratch buffers carved once per step from [`ScratchScope`].
+#[derive(Debug)]
+pub(crate) struct DecodeGemvScratch<'a> {
+    #[cfg(not(feature = "with-kernels"))]
+    portable_raw: &'a mut [u8],
+    #[cfg(not(feature = "with-kernels"))]
+    portable_f32: &'a mut [f32],
+    #[cfg(feature = "with-kernels")]
+    _marker: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> DecodeGemvScratch<'a> {
+    #[cfg_attr(
+        feature = "with-kernels",
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "portable branch checks capacity overflow and returns Result"
+        )
+    )]
+    pub(crate) fn new_in_scope(
+        scope: &'a ScratchScope<'_>,
+        max_cols: usize,
+        partitions: usize,
+    ) -> Result<Self, K3Error> {
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            let eff_parts = partitions.max(1);
+            let raw_len = eff_parts
+                .checked_mul(max_cols)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "DecodeGemvScratch".to_owned(),
+                    offset: 0,
+                    byte_len: usize::MAX,
+                    buffer_len: scope.remaining_bytes(),
+                    reason: "portable decode GEMV raw scratch overflow".to_owned(),
+                })?;
+            let f32_len =
+                eff_parts
+                    .checked_mul(max_cols)
+                    .ok_or_else(|| K3Error::TensorBoundsError {
+                        tensor_name: "DecodeGemvScratch".to_owned(),
+                        offset: 0,
+                        byte_len: usize::MAX,
+                        buffer_len: scope.remaining_bytes(),
+                        reason: "portable decode GEMV f32 scratch overflow".to_owned(),
+                    })?;
+            Ok(Self {
+                portable_raw: scope.alloc_u8(raw_len)?,
+                portable_f32: scope.alloc_f32(f32_len)?,
+            })
+        }
+        #[cfg(feature = "with-kernels")]
+        {
+            let _ = (scope, max_cols, partitions);
+            Ok(Self {
+                _marker: core::marker::PhantomData,
+            })
+        }
+    }
 }
 
 /// Cached `128-byte`-aligned dense projection matrix descriptor.
@@ -694,6 +891,65 @@ impl CachedDenseProjection {
                 .gemm_rows_f32(out, &scratch.f32_buf, scratch.batch_m(), row_range)
         }
     }
+
+    /// Executes row-parallel single-token (`M = 1`) GEMV `out = weights * input` across up to
+    /// `partitions` `WorkerPool` / `rayon` slices using `scope` scratch slices instead of heap
+    /// allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if activation encoding, scratch capacity, or row partition execution fails.
+    pub fn gemv_rows_in_scope(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        partitions: usize,
+    ) -> Result<(), K3Error> {
+        self.gemv_rows_with_pool(out, input, scope, None, partitions)
+    }
+
+    #[cfg_attr(
+        feature = "with-kernels",
+        expect(
+            clippy::needless_pass_by_value,
+            reason = "portable fallback borrows pooled f32/raw slices when with-kernels is off"
+        )
+    )]
+    pub(crate) fn gemv_rows_with_pool(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        pool: Option<&mut DecodeGemvScratch<'_>>,
+        partitions: usize,
+    ) -> Result<(), K3Error> {
+        #[cfg(feature = "with-kernels")]
+        {
+            let _ = pool;
+            let act_view = QuantizedActQ8View::quantize_row_in_scope(input, scope)?;
+            let total_rows = self.inner.rows();
+            if out.len() != total_rows {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "CachedDenseProjection::gemv_rows_in_scope".to_owned(),
+                    offset: 0,
+                    byte_len: size_of_val(out),
+                    buffer_len: total_rows.saturating_mul(size_of::<f32>()),
+                    reason: format!("output length {} != matrix rows {total_rows}", out.len()),
+                });
+            }
+            for_each_row_partition(out, partitions, 8, &|row_start, out_slice| {
+                let row_end = row_start + out_slice.len();
+                self.inner
+                    .gemv_view_rows(out_slice, &act_view, row_start..row_end)
+            })
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            self.inner
+                .gemv_rows_f32_parallel_in_scope(out, input, scope, pool, partitions)
+        }
+    }
 }
 
 /// Outcome of requesting a dense projection from [`MistralLayerCache`].
@@ -704,6 +960,66 @@ pub enum CachedProjectionLookup {
     /// Matrix kept uncached because adding it would exceed the memlock repack budget;
     /// execute directly on borrowed [`TensorView`] bytes without duplicating weight RAM.
     DirectFallback,
+}
+
+/// Pre-built per-expert tensor keys avoiding heap formatting during steady-state `MoE` decode.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpertSlotKeys {
+    pub(crate) gate_direct: String,
+    pub(crate) gate_exps: String,
+    pub(crate) up_direct: String,
+    pub(crate) up_exps: String,
+    pub(crate) down_direct: String,
+    pub(crate) down_exps: String,
+}
+
+/// Pre-built per-layer tensor keys avoiding `format!` allocations during steady-state decode.
+#[derive(Debug, Clone)]
+pub(crate) struct LayerTensorKeys {
+    pub(crate) attn_norm: String,
+    pub(crate) attn_q: String,
+    pub(crate) attn_k: String,
+    pub(crate) attn_v: String,
+    pub(crate) attn_output: String,
+    pub(crate) ffn_norm: String,
+    pub(crate) ffn_gate: String,
+    pub(crate) ffn_up: String,
+    pub(crate) ffn_down: String,
+    pub(crate) ffn_gate_inp: String,
+    pub(crate) gate_stacked: String,
+    pub(crate) up_stacked: String,
+    pub(crate) down_stacked: String,
+    pub(crate) experts: Vec<ExpertSlotKeys>,
+}
+
+fn build_layer_tensor_keys(num_layers: usize, num_experts: usize) -> Vec<LayerTensorKeys> {
+    (0..num_layers)
+        .map(|layer| LayerTensorKeys {
+            attn_norm: format!("blk.{layer}.attn_norm.weight"),
+            attn_q: format!("blk.{layer}.attn_q.weight"),
+            attn_k: format!("blk.{layer}.attn_k.weight"),
+            attn_v: format!("blk.{layer}.attn_v.weight"),
+            attn_output: format!("blk.{layer}.attn_output.weight"),
+            ffn_norm: format!("blk.{layer}.ffn_norm.weight"),
+            ffn_gate: format!("blk.{layer}.ffn_gate.weight"),
+            ffn_up: format!("blk.{layer}.ffn_up.weight"),
+            ffn_down: format!("blk.{layer}.ffn_down.weight"),
+            ffn_gate_inp: format!("blk.{layer}.ffn_gate_inp.weight"),
+            gate_stacked: format!("blk.{layer}.ffn_gate_exps.weight"),
+            up_stacked: format!("blk.{layer}.ffn_up_exps.weight"),
+            down_stacked: format!("blk.{layer}.ffn_down_exps.weight"),
+            experts: (0..num_experts)
+                .map(|expert| ExpertSlotKeys {
+                    gate_direct: format!("blk.{layer}.ffn_gate.{expert}.weight"),
+                    gate_exps: format!("blk.{layer}.ffn_gate_exps.{expert}.weight"),
+                    up_direct: format!("blk.{layer}.ffn_up.{expert}.weight"),
+                    up_exps: format!("blk.{layer}.ffn_up_exps.{expert}.weight"),
+                    down_direct: format!("blk.{layer}.ffn_down.{expert}.weight"),
+                    down_exps: format!("blk.{layer}.ffn_down_exps.{expert}.weight"),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Model-scoped cache for `Mistral` / `Mistral3` / `Mixtral` layer weights and norms.
@@ -721,6 +1037,9 @@ pub struct MistralLayerCache {
     resident_repacked_bytes: usize,
     max_repacked_bytes: usize,
     dense_f32_max_elems: usize,
+    decode_scratch: ScratchWorkspace,
+    layer_keys: Option<Arc<Vec<LayerTensorKeys>>>,
+    key_geometry: Option<(usize, usize)>,
     stats: MistralCacheStats,
 }
 
@@ -734,6 +1053,8 @@ impl MistralLayerCache {
     /// Creates an empty [`MistralLayerCache`] with default memlock repack and half-expansion caps.
     #[must_use]
     pub fn new() -> Self {
+        let decode_scratch =
+            ScratchWorkspace::new(0).unwrap_or_else(|_| unreachable!("zero workspace never fails"));
         Self {
             model_anchor: None,
             norms: HashMap::new(),
@@ -742,6 +1063,9 @@ impl MistralLayerCache {
             resident_repacked_bytes: 0,
             max_repacked_bytes: DEFAULT_MAX_REPACKED_CACHE_BYTES,
             dense_f32_max_elems: DEFAULT_DENSE_F32_MAX_ELEMENTS,
+            decode_scratch,
+            layer_keys: None,
+            key_geometry: None,
             stats: MistralCacheStats::default(),
         }
     }
@@ -851,6 +1175,46 @@ impl MistralLayerCache {
         self.dense_projections.clear();
         self.dense_order.clear();
         self.resident_repacked_bytes = 0;
+        self.decode_scratch.reset();
+        self.layer_keys = None;
+        self.key_geometry = None;
+    }
+
+    /// Returns cached pre-formatted per-layer/per-expert tensor names, building them once per geometry.
+    pub(crate) fn ensure_layer_keys(
+        &mut self,
+        num_layers: usize,
+        num_experts: usize,
+    ) -> Arc<Vec<LayerTensorKeys>> {
+        if self.key_geometry == Some((num_layers, num_experts))
+            && let Some(keys) = &self.layer_keys
+        {
+            return Arc::clone(keys);
+        }
+        let built = Arc::new(build_layer_tensor_keys(num_layers, num_experts));
+        self.layer_keys = Some(Arc::clone(&built));
+        self.key_geometry = Some((num_layers, num_experts));
+        built
+    }
+
+    /// Checks out this cache's reusable `128-byte`-aligned [`ScratchWorkspace`], growing it only when
+    /// current capacity is below `required_bytes`.
+    pub(crate) fn take_decode_scratch(
+        &mut self,
+        required_bytes: usize,
+    ) -> Result<ScratchWorkspace, K3Error> {
+        if self.decode_scratch.capacity_bytes() < required_bytes {
+            self.decode_scratch = ScratchWorkspace::new(required_bytes)?;
+        }
+        self.decode_scratch.reset();
+        let sentinel = ScratchWorkspace::new(0)?;
+        Ok(core::mem::replace(&mut self.decode_scratch, sentinel))
+    }
+
+    /// Restores the checked-out decode [`ScratchWorkspace`] after a decode step completes.
+    pub(crate) fn restore_decode_scratch(&mut self, mut scratch: ScratchWorkspace) {
+        scratch.reset();
+        self.decode_scratch = scratch;
     }
 
     /// Verifies whether `self` is bound to `weights`, invalidating stale entries on model swap.
@@ -991,6 +1355,71 @@ impl MistralLayerCache {
         self.matmul_dense_cached(weights, tensor_name, output, 1, input, scratch)
     }
 
+    /// Executes row-parallel zero-allocation `M = 1` decode GEMV `output = weights[tensor_name] * input`
+    /// across up to `partitions` `WorkerPool` / `rayon` threads within `scope`.
+    ///
+    /// Preserves [`CachedProjectionLookup::DirectFallback`] when `max_repacked_bytes == 0` so
+    /// uncached fallback parity matches scalar `f32`-activation dot products.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on invalid dimensions, missing tensors, or kernel errors.
+    pub fn matvec_dense_decode_in_scope(
+        &mut self,
+        weights: &dyn ModelWeights,
+        tensor_name: &str,
+        output: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        partitions: usize,
+    ) -> Result<(), K3Error> {
+        self.matvec_dense_decode_pooled(
+            weights,
+            tensor_name,
+            output,
+            input,
+            scope,
+            None,
+            partitions,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "decode GEMV coordinates cache, weights, scratch scope, reusable pool, and worker partitions"
+    )]
+    pub(crate) fn matvec_dense_decode_pooled(
+        &mut self,
+        weights: &dyn ModelWeights,
+        tensor_name: &str,
+        output: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        pool: Option<&mut DecodeGemvScratch<'_>>,
+        partitions: usize,
+    ) -> Result<(), K3Error> {
+        let rows = output.len();
+        let cols = input.len();
+        if rows == 0 || cols == 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: 0,
+                byte_len: size_of_val(output),
+                buffer_len: size_of_val(input),
+                reason: "invalid decode GEMV dimensions: rows and cols must be non-zero".to_owned(),
+            });
+        }
+        match self.get_or_repack_dense(weights, tensor_name, rows, cols)? {
+            CachedProjectionLookup::Repacked(proj) => {
+                proj.gemv_rows_with_pool(output, input, scope, pool, partitions)
+            }
+            CachedProjectionLookup::DirectFallback => {
+                let tv = weights.tensor(tensor_name)?;
+                matvec_tensor_rows_parallel(output, &tv, input, partitions)
+            }
+        }
+    }
+
     /// Executes batched `output[m, rows] = input[m, cols] * weights[tensor_name]^T`, caching
     /// `tensor_name` in `128-byte` repacked storage when within budget and reusing `scratch`
     /// (`[m, cols]`).
@@ -1092,6 +1521,85 @@ impl MistralLayerCache {
         }
 
         weights.tensor(&direct_indexed)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "zero-alloc expert slicing delegates across pre-built layer/expert key slots"
+    )]
+    pub(crate) fn slice_expert_projection_by_keys<'a>(
+        &mut self,
+        weights: &'a dyn ModelWeights,
+        keys: &LayerTensorKeys,
+        layer: usize,
+        proj: &str,
+        expert_idx: usize,
+        num_experts: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> Result<TensorView<'a>, K3Error> {
+        let Some(slot) = keys.experts.get(expert_idx) else {
+            return self.slice_expert_projection(
+                weights,
+                layer,
+                proj,
+                expert_idx,
+                num_experts,
+                expected_rows,
+                expected_cols,
+            );
+        };
+        let (stacked, direct_indexed, exps_indexed) = match proj {
+            "gate" => (
+                keys.gate_stacked.as_str(),
+                slot.gate_direct.as_str(),
+                slot.gate_exps.as_str(),
+            ),
+            "up" => (
+                keys.up_stacked.as_str(),
+                slot.up_direct.as_str(),
+                slot.up_exps.as_str(),
+            ),
+            "down" => (
+                keys.down_stacked.as_str(),
+                slot.down_direct.as_str(),
+                slot.down_exps.as_str(),
+            ),
+            _ => {
+                return self.slice_expert_projection(
+                    weights,
+                    layer,
+                    proj,
+                    expert_idx,
+                    num_experts,
+                    expected_rows,
+                    expected_cols,
+                );
+            }
+        };
+
+        self.stats.expert_zero_copy_slices += 1;
+        if weights.contains_tensor(stacked) {
+            let tensor = weights.tensor(stacked)?;
+            return slice_packed_expert(
+                &tensor,
+                expert_idx,
+                num_experts,
+                expected_rows,
+                expected_cols,
+            );
+        }
+        if weights.contains_tensor(direct_indexed) {
+            let tensor = weights.tensor(direct_indexed)?;
+            let _ = resolve_2d_dims(&tensor, expected_rows, expected_cols)?;
+            return Ok(tensor);
+        }
+        if weights.contains_tensor(exps_indexed) {
+            let tensor = weights.tensor(exps_indexed)?;
+            let _ = resolve_2d_dims(&tensor, expected_rows, expected_cols)?;
+            return Ok(tensor);
+        }
+        weights.tensor(direct_indexed)
     }
 
     fn remove_dense_entry(&mut self, name: &str) {
@@ -1850,5 +2358,77 @@ mod tests {
                 .expect("tight check")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_wave4_gemv_rows_in_scope_and_layer_keys_miri() {
+        let mut weights = CacheTestWeights::default();
+        let rows = 16_usize;
+        let cols = 32_usize;
+        for quant in [QuantType::F32, QuantType::Q4_0] {
+            let name = format!("blk.0.w_{}.weight", quant.as_str());
+            weights.insert(
+                &name,
+                quant,
+                vec![cols, rows],
+                encode_matrix_bytes(quant, rows, cols, 61),
+            );
+        }
+        let mut stacked = Vec::new();
+        for e in 0..4 {
+            stacked.extend_from_slice(&encode_matrix_bytes(QuantType::F16, 8, 16, 70 + e));
+        }
+        weights.insert(
+            "blk.0.ffn_gate_exps.weight",
+            QuantType::F16,
+            vec![16, 8, 4],
+            stacked,
+        );
+
+        let input: Vec<f32> = (0..cols)
+            .map(|i| (f32::from(u8::try_from((i * 5 + 1) % 17).unwrap_or(0)) - 8.0) * 0.05)
+            .collect();
+
+        let mut ws = ScratchWorkspace::new(32 * 1024).expect("scratch");
+        let mut cache = MistralLayerCache::new();
+        let keys = cache.ensure_layer_keys(1, 4);
+        assert_eq!(keys[0].attn_q, "blk.0.attn_q.weight");
+        let sliced = cache
+            .slice_expert_projection_by_keys(&weights, &keys[0], 0, "gate", 2, 4, 8, 16)
+            .expect("slice expert by pre-built keys");
+        assert_eq!(sliced.as_bytes().len(), 8 * 16 * 2);
+
+        for quant in [QuantType::F32, QuantType::Q4_0] {
+            let name = format!("blk.0.w_{}.weight", quant.as_str());
+            let mut baseline_bits = Vec::new();
+            for parts in [1_usize, 4, 8] {
+                let mut out = vec![0.0_f32; rows];
+                let mut cp = ws.checkpoint();
+                let scope = cp.workspace().scope();
+                let check_align = scope.alloc_f32(8).expect("aligned probe");
+                assert_eq!(
+                    check_align
+                        .as_ptr()
+                        .align_offset(WEIGHT_CACHE_ALIGNMENT_BYTES),
+                    0
+                );
+                cache
+                    .matvec_dense_decode_in_scope(&weights, &name, &mut out, &input, &scope, parts)
+                    .expect("decode gemv in scope");
+                let bits: Vec<u32> = out.iter().map(|v| v.to_bits()).collect();
+                assert!(out.iter().all(|v| v.is_finite()));
+                if baseline_bits.is_empty() {
+                    baseline_bits = bits;
+                } else {
+                    assert_eq!(bits, baseline_bits, "quant={quant:?} parts={parts}");
+                }
+            }
+        }
+        assert!(ws.peak_used_bytes() > 0);
+        let taken = cache
+            .take_decode_scratch(4096)
+            .expect("take internal scratch");
+        assert!(taken.capacity_bytes() >= 4096);
+        cache.restore_decode_scratch(taken);
     }
 }

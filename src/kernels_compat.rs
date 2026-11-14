@@ -1,5 +1,7 @@
 //! Unified compute and dequantization dispatchers across `with-kernels` and portable fallback builds.
 
+use core::f32::consts::PI;
+
 use jero_core::{K3Error, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
@@ -7,13 +9,9 @@ pub use jero_kernels_rvv::RopeScalingConfig;
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
     AttentionMaskConfig, BaselineKernel, VectorKernel, bf16_to_f32_finite, dequantize_token_row,
-    f16_to_f32_finite, gqa_causal_attention_f32, gqa_causal_attention_prefill_f32,
-    precompute_rope_inv_freq, swiglu_f32, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0, vec_dot_q5_k,
-    vec_dot_q6_k, vec_dot_q8_0,
+    f16_to_f32_finite, gqa_causal_attention_prefill_f32, gqa_causal_attention_with_scratch_f32,
+    swiglu_f32, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0, vec_dot_q5_k, vec_dot_q6_k, vec_dot_q8_0,
 };
-
-#[cfg(not(feature = "with-kernels"))]
-use core::f32::consts::PI;
 
 /// Rotary position embedding scaling configurations.
 #[cfg(not(feature = "with-kernels"))]
@@ -199,6 +197,155 @@ pub(crate) fn matvec_tensor(
     matmul_tensor(output, weights, 1, input, output.len(), input.len())
 }
 
+/// Computes a tile-aligned midpoint split index inside `1..slice_len` when `slice_len >= 2 * align`.
+#[inline]
+pub(crate) fn aligned_partition_mid(
+    slice_len: usize,
+    left_parts: usize,
+    total_parts: usize,
+    tile_align: usize,
+) -> usize {
+    let raw_mid = (slice_len * left_parts) / total_parts;
+    let align = tile_align.max(1);
+    if align > 1 && slice_len >= align * 2 {
+        let rounded = (raw_mid + align / 2) / align * align;
+        if rounded > 0 && rounded < slice_len {
+            return rounded;
+        }
+    }
+    raw_mid.max(1).min(slice_len - 1)
+}
+
+/// Partitions `output` across up to `partitions` disjoint row ranges aligned to `tile_align`,
+/// executing chunks recursively across `rayon` worker threads when `partitions > 1` (sequential under Miri).
+pub(crate) fn for_each_row_partition<F>(
+    output: &mut [f32],
+    partitions: usize,
+    tile_align: usize,
+    op: &F,
+) -> Result<(), K3Error>
+where
+    F: Fn(usize, &mut [f32]) -> Result<(), K3Error> + Sync,
+{
+    fn run_partition<F>(
+        row_start: usize,
+        slice: &mut [f32],
+        parts: usize,
+        tile_align: usize,
+        op: &F,
+    ) -> Result<(), K3Error>
+    where
+        F: Fn(usize, &mut [f32]) -> Result<(), K3Error> + Sync,
+    {
+        if parts <= 1 || slice.len() <= 1 {
+            return op(row_start, slice);
+        }
+        let left_parts = parts / 2;
+        let right_parts = parts - left_parts;
+        let align = tile_align.max(1);
+        let mid = aligned_partition_mid(slice.len(), left_parts, parts, align);
+        let (left, right) = slice.split_at_mut(mid);
+        #[cfg(miri)]
+        {
+            run_partition(row_start, left, left_parts, align, op)?;
+            run_partition(row_start + mid, right, right_parts, align, op)
+        }
+        #[cfg(not(miri))]
+        {
+            let (lhs, rhs) = rayon::join(
+                || run_partition(row_start, left, left_parts, align, op),
+                || run_partition(row_start + mid, right, right_parts, align, op),
+            );
+            lhs?;
+            rhs
+        }
+    }
+
+    if output.is_empty() {
+        return Ok(());
+    }
+    let parts = partitions.max(1).min(output.len());
+    run_partition(0, output, parts, tile_align, op)
+}
+
+/// Zero-copy slices the contiguous byte range corresponding to rows `[row_start..row_start + row_count]`
+/// from a 2D weight tensor in either `[cols, rows]` or `[rows, cols]` shape order.
+pub(crate) fn slice_tensor_rows_bytes<'a>(
+    tensor: &TensorView<'a>,
+    expected_rows: usize,
+    expected_cols: usize,
+    row_start: usize,
+    row_count: usize,
+) -> Result<&'a [u8], K3Error> {
+    let (rows, cols) = resolve_2d_dims(tensor, expected_rows, expected_cols)?;
+    let end_row = row_start
+        .checked_add(row_count)
+        .ok_or_else(|| tensor_bounds_err(tensor, row_start, "row slice range overflow"))?;
+    if end_row > rows {
+        return Err(tensor_bounds_err(
+            tensor,
+            row_start,
+            &format!("row slice [{row_start}..{end_row}] exceeds matrix rows {rows}"),
+        ));
+    }
+    let quant = tensor.quant();
+    let block_elems = quant.block_elements();
+    if cols % block_elems != 0 {
+        return Err(tensor_bounds_err(
+            tensor,
+            0,
+            &format!(
+                "matrix cols {cols} not divisible by {} block size {block_elems}",
+                quant.as_str()
+            ),
+        ));
+    }
+    let row_bytes = (cols / block_elems) * quant.block_bytes();
+    let byte_start = row_start
+        .checked_mul(row_bytes)
+        .ok_or_else(|| tensor_bounds_err(tensor, usize::MAX, "row slice byte start overflow"))?;
+    let byte_end = end_row
+        .checked_mul(row_bytes)
+        .ok_or_else(|| tensor_bounds_err(tensor, usize::MAX, "row slice byte end overflow"))?;
+    let raw = tensor.as_bytes();
+    if byte_end > raw.len() {
+        return Err(tensor_bounds_err(
+            tensor,
+            byte_end,
+            "truncated 2D weight payload for row slice",
+        ));
+    }
+    Ok(&raw[byte_start..byte_end])
+}
+
+/// Executes a row-parallel zero-allocation `M = 1` matrix-vector product `output = weights * input`
+/// across up to `partitions` `WorkerPool` / `rayon` row slices.
+pub(crate) fn matvec_tensor_rows_parallel(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+    partitions: usize,
+) -> Result<(), K3Error> {
+    let expected_rows = output.len();
+    let expected_cols = input.len();
+    if expected_rows == 0 || expected_cols == 0 {
+        return Err(tensor_bounds_err(
+            weights,
+            0,
+            "row-parallel matvec dimensions must be non-zero",
+        ));
+    }
+    let (rows, cols) = resolve_2d_dims(weights, expected_rows, expected_cols)?;
+    let _ = slice_tensor_rows_bytes(weights, rows, cols, 0, rows)?;
+    for_each_row_partition(output, partitions, 8, &|row_start, out_slice| {
+        let raw_sub = slice_tensor_rows_bytes(weights, rows, cols, row_start, out_slice.len())?;
+        let sub_shape = [cols, out_slice.len()];
+        let sub_tv =
+            TensorView::from_bytes(weights.name(), weights.quant(), &sub_shape, 0, raw_sub)?;
+        matvec_tensor(out_slice, &sub_tv, input)
+    })
+}
+
 /// Executes a batched 2D matrix multiplication `output[M, rows] = input[M, cols] * weights[rows, cols]^T`
 /// across all admitted quantizations.
 pub(crate) fn matmul_tensor(
@@ -334,6 +481,127 @@ pub(crate) fn swiglu_compat(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result
     }
 }
 
+fn scale_rope_freq_at(
+    base_theta: f32,
+    pair_idx: usize,
+    dim_pairs: usize,
+    scaling: Option<&RopeScalingConfig>,
+    seq_len: usize,
+) -> Result<f32, K3Error> {
+    match scaling {
+        None => Ok(base_theta),
+        Some(RopeScalingConfig::Linear { factor }) => {
+            if !factor.is_finite() || *factor <= 0.0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: format!("invalid linear RoPE factor {factor}"),
+                });
+            }
+            Ok(base_theta / factor)
+        }
+        Some(RopeScalingConfig::Llama3Smooth {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position_embeddings,
+        }) => {
+            if !factor.is_finite()
+                || *factor <= 0.0
+                || !low_freq_factor.is_finite()
+                || *low_freq_factor <= 0.0
+                || !high_freq_factor.is_finite()
+                || *high_freq_factor <= 0.0
+                || *original_max_position_embeddings == 0
+                || low_freq_factor >= high_freq_factor
+            {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: "invalid smooth RoPE scaling parameters".to_owned(),
+                });
+            }
+            let wavelen = (2.0_f32 * PI) / base_theta;
+            #[expect(clippy::cast_precision_loss, reason = "context length fits in f32")]
+            let orig_f32 = *original_max_position_embeddings as f32;
+            let low_wavelen = orig_f32 / low_freq_factor;
+            let high_wavelen = orig_f32 / high_freq_factor;
+            if wavelen < high_wavelen {
+                Ok(base_theta)
+            } else if wavelen > low_wavelen {
+                Ok(base_theta / factor)
+            } else {
+                let smooth = (((orig_f32 / wavelen) - low_freq_factor)
+                    / (high_freq_factor - low_freq_factor))
+                    .clamp(0.0, 1.0);
+                Ok((1.0_f32 - smooth) * (base_theta / factor) + smooth * base_theta)
+            }
+        }
+        Some(RopeScalingConfig::LongRope {
+            short_factor,
+            long_factor,
+            original_max_position_embeddings,
+        }) => {
+            if short_factor.len() != dim_pairs || long_factor.len() != dim_pairs {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: "LongRope factor lengths must match head_dim / 2".to_owned(),
+                });
+            }
+            let s_fac = short_factor[pair_idx];
+            let l_fac = long_factor[pair_idx];
+            if !s_fac.is_finite() || s_fac <= 0.0 || !l_fac.is_finite() || l_fac <= 0.0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: format!("invalid LongRope factors short={s_fac}, long={l_fac}"),
+                });
+            }
+            let f = if seq_len > *original_max_position_embeddings {
+                l_fac
+            } else {
+                s_fac
+            };
+            Ok(base_theta / f)
+        }
+    }
+}
+
+/// Precomputes `RoPE` inverse frequency table `inv_freq[0..head_dim/2]` without heap allocation.
+pub(crate) fn fill_rope_inv_freq_compat(
+    head_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScalingConfig>,
+    seq_len: usize,
+    inv_freq_out: &mut [f32],
+) -> Result<(), K3Error> {
+    if head_dim == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "invalid RoPE parameters".to_owned(),
+        });
+    }
+    let dim_pairs = head_dim / 2;
+    if inv_freq_out.len() != dim_pairs {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: format!(
+                "inv_freq_out length {} must equal head_dim / 2 ({dim_pairs})",
+                inv_freq_out.len()
+            ),
+        });
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "head_dim fits comfortably in f32"
+    )]
+    let hd_f32 = head_dim as f32;
+    for (i, slot) in inv_freq_out.iter_mut().enumerate() {
+        #[expect(clippy::cast_precision_loss, reason = "index fits cleanly in f32")]
+        let base_theta = 1.0_f32 / theta.powf(((2 * i) as f32) / hd_f32);
+        *slot = scale_rope_freq_at(base_theta, i, dim_pairs, scaling, seq_len)?;
+    }
+    Ok(())
+}
+
 /// Precomputes `RoPE` inverse frequency table `inv_freq[0..head_dim/2]`.
 pub(crate) fn rope_inv_freq_compat(
     head_dim: usize,
@@ -341,22 +609,23 @@ pub(crate) fn rope_inv_freq_compat(
     scaling: Option<&RopeScalingConfig>,
     seq_len: usize,
 ) -> Result<Vec<f32>, K3Error> {
-    #[cfg(feature = "with-kernels")]
-    {
-        precompute_rope_inv_freq(head_dim, theta, scaling, seq_len)
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "invalid RoPE parameters".to_owned(),
+        });
     }
-    #[cfg(not(feature = "with-kernels"))]
-    {
-        precompute_rope_inv_freq_portable(head_dim, theta, scaling, seq_len)
-    }
+    let mut inv_freq = vec![0.0_f32; head_dim / 2];
+    fill_rope_inv_freq_compat(head_dim, theta, scaling, seq_len, &mut inv_freq)?;
+    Ok(inv_freq)
 }
 
-/// Executes grouped-query causal attention over the active KV cache slice.
+/// Executes grouped-query causal attention over the active KV cache slice using caller-provided scratch.
 #[expect(
     clippy::too_many_arguments,
-    reason = "matches gqa_causal_attention_f32 signature"
+    reason = "matches gqa_causal_attention_with_scratch_f32 signature"
 )]
-pub(crate) fn gqa_attention_compat(
+pub(crate) fn gqa_attention_with_scratch_compat(
     out: &mut [f32],
     q: &[f32],
     k_cache: &[f32],
@@ -366,17 +635,36 @@ pub(crate) fn gqa_attention_compat(
     head_dim: usize,
     seq_len: usize,
     scale: f32,
+    scores_scratch: &mut [f32],
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        gqa_causal_attention_f32(
-            out, q, k_cache, v_cache, n_heads_q, n_heads_kv, head_dim, seq_len, scale,
+        gqa_causal_attention_with_scratch_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            seq_len,
+            scale,
+            scores_scratch,
         )
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        gqa_attention_portable(
-            out, q, k_cache, v_cache, n_heads_q, n_heads_kv, head_dim, seq_len, scale,
+        gqa_attention_with_scratch_portable(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            seq_len,
+            scale,
+            scores_scratch,
         )
     }
 }
@@ -458,10 +746,10 @@ fn matmul_f32_rows(
         ));
     }
 
-    let mut row_buf = vec![0.0_f32; cols];
+    let mut row_chunk = [0.0_f32; 256];
     for r in 0..rows {
         let base = r * row_bytes;
-        for (c, dst) in row_buf.iter_mut().enumerate() {
+        for c in 0..cols {
             let off = base + c * 4;
             let val = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
             if !val.is_finite() {
@@ -471,11 +759,21 @@ fn matmul_f32_rows(
                     "non-finite F32 element encountered in matrix weight",
                 ));
             }
-            *dst = val;
         }
         for t in 0..m {
             let x_row = &input[t * cols..(t + 1) * cols];
-            output[t * rows + r] = dot_f32_compat(&row_buf, x_row);
+            let mut acc = 0.0_f32;
+            let mut col = 0_usize;
+            while col < cols {
+                let n = (cols - col).min(row_chunk.len());
+                for (i, dst) in row_chunk[..n].iter_mut().enumerate() {
+                    let off = base + (col + i) * 4;
+                    *dst = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                }
+                acc += dot_f32_compat(&row_chunk[..n], &x_row[col..col + n]);
+                col += n;
+            }
+            output[t * rows + r] = acc;
         }
     }
     Ok(())
@@ -696,12 +994,53 @@ fn matmul_portable(
         ));
     }
 
-    let mut row_buf = vec![0.0_f32; cols];
+    let block_bytes = quant.block_bytes();
+    let row_bytes = (cols / block_elems) * block_bytes;
+    let raw = weights.as_bytes();
+    if raw.len() < rows * row_bytes {
+        return Err(tensor_bounds_err(
+            weights,
+            rows * row_bytes,
+            "truncated matrix payload",
+        ));
+    }
+
+    let mut block_buf = [0.0_f32; 256];
+    let n_blocks = cols / block_elems;
     for r in 0..rows {
-        dequantize_row_portable(weights, r, &mut row_buf)?;
+        let row_slice = &raw[r * row_bytes..(r + 1) * row_bytes];
         for t in 0..m {
             let x_row = &input[t * cols..(t + 1) * cols];
-            output[t * rows + r] = dot_f32_compat(&row_buf, x_row);
+            let mut acc = 0.0_f32;
+            match quant {
+                QuantType::F16 | QuantType::BF16 => {
+                    let mut col = 0_usize;
+                    while col < cols {
+                        let n = (cols - col).min(block_buf.len());
+                        for (i, dst) in block_buf[..n].iter_mut().enumerate() {
+                            let off = (col + i) * 2;
+                            let bits = u16::from_le_bytes([row_slice[off], row_slice[off + 1]]);
+                            *dst = if quant == QuantType::F16 {
+                                f16_to_f32_portable(bits)
+                            } else {
+                                bf16_to_f32_portable(bits)
+                            };
+                        }
+                        acc += dot_f32_compat(&block_buf[..n], &x_row[col..col + n]);
+                        col += n;
+                    }
+                }
+                _ => {
+                    for blk in 0..n_blocks {
+                        let b_slice = &row_slice[blk * block_bytes..(blk + 1) * block_bytes];
+                        let dst = &mut block_buf[..block_elems];
+                        decode_quant_row_portable(quant, b_slice, dst);
+                        let x_sub = &x_row[blk * block_elems..(blk + 1) * block_elems];
+                        acc += dot_f32_compat(dst, x_sub);
+                    }
+                }
+            }
+            output[t * rows + r] = acc;
         }
     }
     Ok(())
@@ -867,106 +1206,6 @@ fn decode_q6_k_portable(block: &[u8], out: &mut [f32]) {
 }
 
 #[cfg(not(feature = "with-kernels"))]
-fn precompute_rope_inv_freq_portable(
-    head_dim: usize,
-    theta: f32,
-    scaling: Option<&RopeScalingConfig>,
-    seq_len: usize,
-) -> Result<Vec<f32>, K3Error> {
-    if head_dim == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
-        return Err(K3Error::CapabilityMismatch {
-            architecture: "rope".to_owned(),
-            reason: "invalid RoPE parameters".to_owned(),
-        });
-    }
-    let dim_pairs = head_dim / 2;
-    let mut inv_freq = Vec::with_capacity(dim_pairs);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "head_dim fits comfortably in f32"
-    )]
-    let hd_f32 = head_dim as f32;
-    for i in 0..dim_pairs {
-        #[expect(clippy::cast_precision_loss, reason = "index fits cleanly in f32")]
-        let base_theta = 1.0_f32 / theta.powf(((2 * i) as f32) / hd_f32);
-        let scaled = match scaling {
-            None => base_theta,
-            Some(RopeScalingConfig::Linear { factor }) => {
-                if !factor.is_finite() || *factor <= 0.0 {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: format!("invalid linear RoPE factor {factor}"),
-                    });
-                }
-                base_theta / factor
-            }
-            Some(RopeScalingConfig::Llama3Smooth {
-                factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position_embeddings,
-            }) => {
-                if !factor.is_finite()
-                    || *factor <= 0.0
-                    || !low_freq_factor.is_finite()
-                    || *low_freq_factor <= 0.0
-                    || !high_freq_factor.is_finite()
-                    || *high_freq_factor <= 0.0
-                    || *original_max_position_embeddings == 0
-                    || low_freq_factor >= high_freq_factor
-                {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: "invalid smooth RoPE scaling parameters".to_owned(),
-                    });
-                }
-                let wavelen = (2.0_f32 * PI) / base_theta;
-                #[expect(clippy::cast_precision_loss, reason = "context length fits in f32")]
-                let orig_f32 = *original_max_position_embeddings as f32;
-                let low_wavelen = orig_f32 / low_freq_factor;
-                let high_wavelen = orig_f32 / high_freq_factor;
-                if wavelen < high_wavelen {
-                    base_theta
-                } else if wavelen > low_wavelen {
-                    base_theta / factor
-                } else {
-                    let smooth = (((orig_f32 / wavelen) - low_freq_factor)
-                        / (high_freq_factor - low_freq_factor))
-                        .clamp(0.0, 1.0);
-                    (1.0_f32 - smooth) * (base_theta / factor) + smooth * base_theta
-                }
-            }
-            Some(RopeScalingConfig::LongRope {
-                short_factor,
-                long_factor,
-                original_max_position_embeddings,
-            }) => {
-                if short_factor.len() != dim_pairs || long_factor.len() != dim_pairs {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: "LongRope factor lengths must match head_dim / 2".to_owned(),
-                    });
-                }
-                let f = if seq_len > *original_max_position_embeddings {
-                    long_factor[i]
-                } else {
-                    short_factor[i]
-                };
-                if !f.is_finite() || f <= 0.0 {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: format!("invalid LongRope factor {f}"),
-                    });
-                }
-                base_theta / f
-            }
-        };
-        inv_freq.push(scaled);
-    }
-    Ok(inv_freq)
-}
-
-#[cfg(not(feature = "with-kernels"))]
 fn softmax_scores_portable(scores: &mut [f32]) {
     let mut max_score = f32::NEG_INFINITY;
     for &s in scores.iter() {
@@ -993,9 +1232,9 @@ fn softmax_scores_portable(scores: &mut [f32]) {
 #[cfg(not(feature = "with-kernels"))]
 #[expect(
     clippy::too_many_arguments,
-    reason = "matches gqa_causal_attention_f32 signature"
+    reason = "matches gqa_causal_attention_with_scratch_f32 signature"
 )]
-fn gqa_attention_portable(
+fn gqa_attention_with_scratch_portable(
     out: &mut [f32],
     q: &[f32],
     k_cache: &[f32],
@@ -1005,6 +1244,7 @@ fn gqa_attention_portable(
     head_dim: usize,
     seq_len: usize,
     scale: f32,
+    scores_scratch: &mut [f32],
 ) -> Result<(), K3Error> {
     if n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0 || seq_len == 0 {
         return Err(K3Error::CapabilityMismatch {
@@ -1024,6 +1264,7 @@ fn gqa_attention_portable(
         || out.len() != q_expected
         || k_cache.len() != kv_expected
         || v_cache.len() != kv_expected
+        || scores_scratch.len() < seq_len
     {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gqa".to_owned(),
@@ -1036,7 +1277,7 @@ fn gqa_attention_portable(
 
     let kv_group_size = n_heads_q / n_heads_kv;
     let kv_stride = n_heads_kv * head_dim;
-    let mut scores = vec![0.0_f32; seq_len];
+    let scores = &mut scores_scratch[..seq_len];
 
     for h in 0..n_heads_q {
         let kv_h = h / kv_group_size;
@@ -1045,7 +1286,7 @@ fn gqa_attention_portable(
             let k_off = t * kv_stride + kv_h * head_dim;
             *score_slot = dot_f32_compat(q_head, &k_cache[k_off..k_off + head_dim]) * scale;
         }
-        softmax_scores_portable(&mut scores);
+        softmax_scores_portable(scores);
         let out_head = &mut out[h * head_dim..(h + 1) * head_dim];
         out_head.fill(0.0);
         for (t, &prob) in scores.iter().enumerate() {

@@ -13,14 +13,15 @@
   <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/jero-arch-mistral/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
----
+______________________________________________________________________
 
-Mistral and Mixtral architecture recipe (supporting `mistral` Sliding Window Attention and `mixtral` Sparse Mixture-of-Experts) for the SpacemiT K3 platform.
+Mistral and Mixtral architecture recipe (supporting `mistral` Sliding Window Attention, `mistral3`, and `mixtral` Sparse Mixture-of-Experts) for the SpacemiT K3 platform.
 
-## Architecture & Specifications
-For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
-- Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
-- Specs: [specs/runtime/](https://github.com/LMA1980/model-runner/tree/main/specs/runtime)
+## Ecosystem & Documentation
+
+- **Public Documentation Portal**: [`lma1980.github.io/model-runner`](https://github.com/LMA1980/lma1980.github.io/tree/main/model-runner) ([Reference Manual](https://github.com/LMA1980/lma1980.github.io/blob/main/model-runner/manual.md), [Crate Docs](https://github.com/LMA1980/lma1980.github.io/tree/main/model-runner/docs/crates))
+- **Upstream Dependencies**: [`jero-core`](https://github.com/LMA1980/jero-core) and [`jero-kernels-rvv`](https://github.com/LMA1980/jero-kernels-rvv) (via the optional `with-kernels` feature)
+- **Downstream Consumers**: [`jero-engine`](https://github.com/LMA1980/jero-engine) and [`jero-manager`](https://github.com/LMA1980/jero-manager)
 
 ## License
 

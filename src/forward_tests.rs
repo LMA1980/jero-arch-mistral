@@ -17,11 +17,11 @@ use crate::{MistralRecipe, RopeScalingConfig, route_top2_experts};
 
 /// Asserts logit parity against an `f32`-activation scalar reference.
 ///
-/// Exact float formats (`F32`, `F16`, `BF16`) and non-repacked `DirectFallback`
+/// Exact float formats (`F32`, `F16`, `BF16`) and non-`riscv64`/Miri `DirectFallback`
 /// runs must match within `< 1e-3`. With `with-kernels` enabled, quantized
-/// dense projections dynamically quantize activations to `Q8`, so normalized
-/// delta (`< 1.5e-2`) and cosine similarity (`> 0.999`) are verified alongside
-/// strict `< 1e-3` `DirectFallback` parity.
+/// dense projections (and `DirectFallback` matvec kernels on `riscv64`) dynamically
+/// quantize activations to `Q8`, so normalized delta (`< 2e-2`) and cosine
+/// similarity (`> 0.999`) are verified alongside strict `< 1e-3` scalar parity.
 fn assert_logits_parity(
     label: &str,
     quant: QuantType,
@@ -897,6 +897,63 @@ fn test_dense_swa_window_eviction_kv_view_and_reference_parity() {
     assert!(recipe.prefill_step(&mut ctx_bad, &weights).is_err());
 }
 
+#[cfg(all(target_arch = "riscv64", feature = "with-kernels", not(miri)))]
+fn assert_rvv_q8_matvec_parity(
+    label: &str,
+    quant: QuantType,
+    raw: &[u8],
+    cols: usize,
+    input: &[f32],
+    out: &[f32],
+    expected_rows: &[f32],
+) {
+    let row_bytes = quant.storage_bytes(label, cols).expect("valid row bytes");
+    match quant {
+        QuantType::Q4_0 | QuantType::Q8_0 => {
+            let mut x_q8 = vec![jero_kernels_rvv::BlockQ8_0::ZERO; cols / 32];
+            jero_kernels_rvv::quantize_row_q8_0_f32(input, &mut x_q8).expect("quantize Q8_0");
+            for (r, &actual) in out.iter().enumerate() {
+                let row_slice = &raw[r * row_bytes..(r + 1) * row_bytes];
+                let q8_ref =
+                    match quant {
+                        QuantType::Q4_0 => jero_kernels_rvv::vec_dot_q4_0_q8_0(row_slice, &x_q8)
+                            .expect("q4_0 q8_0"),
+                        QuantType::Q8_0 => jero_kernels_rvv::vec_dot_q8_0_q8_0(row_slice, &x_q8)
+                            .expect("q8_0 q8_0"),
+                        _ => unreachable!(),
+                    };
+                assert!(
+                    (actual - q8_ref).abs() < 1e-4,
+                    "{label} ({quant:?}) row {r} Q8_0 parity mismatch: got {actual}, q8_ref {q8_ref}"
+                );
+            }
+        }
+        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q6_K => {
+            let mut x_q8k = vec![jero_kernels_rvv::BlockQ8K::ZERO; cols / 256];
+            jero_kernels_rvv::quantize_row_q8_k(input, &mut x_q8k).expect("quantize Q8K");
+            for (r, &actual) in out.iter().enumerate() {
+                let row_slice = &raw[r * row_bytes..(r + 1) * row_bytes];
+                let q8k_ref =
+                    match quant {
+                        QuantType::Q4_K_M => jero_kernels_rvv::vec_dot_q4_k_q8_k(row_slice, &x_q8k)
+                            .expect("q4_k q8_k"),
+                        QuantType::Q5_K => jero_kernels_rvv::vec_dot_q5_k_q8_k(row_slice, &x_q8k)
+                            .expect("q5_k q8_k"),
+                        QuantType::Q6_K => jero_kernels_rvv::vec_dot_q6_k_q8_k(row_slice, &x_q8k)
+                            .expect("q6_k q8_k"),
+                        _ => unreachable!(),
+                    };
+                assert!(
+                    (actual - q8k_ref).abs() < 1e-3,
+                    "{label} ({quant:?}) row {r} Q8K parity mismatch: got {actual}, q8k_ref {q8k_ref}"
+                );
+            }
+        }
+        _ => unreachable!(),
+    }
+    assert_logits_parity(label, quant, out, expected_rows, false);
+}
+
 #[test]
 #[expect(clippy::cast_precision_loss)]
 fn test_non_k_quants_and_square_matrix_disambiguation_miri() {
@@ -923,8 +980,24 @@ fn test_non_k_quants_and_square_matrix_disambiguation_miri() {
         let mut out = vec![0.0_f32; 2];
         matvec_tensor(&mut out, &tv, &input_32).expect("non-k matvec");
         let ref_rows = decode_matrix_rows_f32(&tv, 2, 32);
-        for (r, row) in ref_rows.iter().enumerate() {
-            let expected: f32 = row.iter().zip(&input_32).map(|(&a, &b)| a * b).sum();
+        let expected_rows: Vec<f32> = ref_rows
+            .iter()
+            .map(|row| row.iter().zip(&input_32).map(|(&a, &b)| a * b).sum())
+            .collect();
+        #[cfg(all(target_arch = "riscv64", feature = "with-kernels", not(miri)))]
+        if matches!(quant, QuantType::Q4_0 | QuantType::Q8_0) {
+            assert_rvv_q8_matvec_parity(
+                "nonk matvec",
+                quant,
+                &bytes,
+                32,
+                &input_32,
+                &out,
+                &expected_rows,
+            );
+            continue;
+        }
+        for (r, &expected) in expected_rows.iter().enumerate() {
             assert!((out[r] - expected).abs() < 1e-3);
         }
     }
@@ -962,12 +1035,17 @@ fn test_non_k_quants_and_square_matrix_disambiguation_miri() {
     recipe
         .decode_step_with_cache(&mut ctx_fb, &weights, &mut fb_cache)
         .expect("fallback decode");
+    let strict_fallback = !cfg!(all(
+        target_arch = "riscv64",
+        feature = "with-kernels",
+        not(miri)
+    ));
     assert_logits_parity(
         "Q4_0 DirectFallback path",
         QuantType::Q4_0,
         ctx_fb.logits(),
         &ref_logits,
-        true,
+        strict_fallback,
     );
 }
 
@@ -985,8 +1063,24 @@ fn test_k_quants_matvec_and_embedding_miri() {
         matvec_tensor(&mut out, &tv, &input).expect("k-quant matvec");
 
         let ref_rows = decode_matrix_rows_f32(&tv, 3, 256);
-        for (r, row) in ref_rows.iter().enumerate() {
-            let expected: f32 = row.iter().zip(&input).map(|(&a, &b)| a * b).sum();
+        let expected_rows: Vec<f32> = ref_rows
+            .iter()
+            .map(|row| row.iter().zip(&input).map(|(&a, &b)| a * b).sum())
+            .collect();
+        #[cfg(all(target_arch = "riscv64", feature = "with-kernels", not(miri)))]
+        {
+            assert_rvv_q8_matvec_parity(
+                "k-quant matvec",
+                quant,
+                &bytes,
+                256,
+                &input,
+                &out,
+                &expected_rows,
+            );
+        }
+        #[cfg(any(not(target_arch = "riscv64"), not(feature = "with-kernels"), miri))]
+        for (r, &expected) in expected_rows.iter().enumerate() {
             assert!(
                 (out[r] - expected).abs() < 1e-2,
                 "k-quant {quant:?} row {r} mismatch: got {}, expected {expected}",
@@ -1094,12 +1188,17 @@ fn test_mixtral_router_matvec_packed_3d_vs_split_2d_experts_miri() {
     recipe
         .prefill_step_with_cache(&mut ctx_fb, &w_packed, &mut fb_cache)
         .expect("fallback moe prefill");
+    let strict_fallback = !cfg!(all(
+        target_arch = "riscv64",
+        feature = "with-kernels",
+        not(miri)
+    ));
     assert_logits_parity(
         "Mixtral MoE DirectFallback path",
         quant,
         ctx_fb.logits(),
         &ref_logits,
-        true,
+        strict_fallback,
     );
 }
 

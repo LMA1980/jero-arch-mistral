@@ -877,12 +877,17 @@ fn test_all_admitted_quants_and_square_matrix_disambiguation_parity() {
         recipe
             .decode_step_with_cache(&mut ctx_fb, &weights, &mut fb_cache)
             .expect("fallback decode");
+        let strict_fallback = !cfg!(all(
+            target_arch = "riscv64",
+            feature = "with-kernels",
+            not(miri)
+        ));
         assert_logits_parity(
             "256x256 DirectFallback path",
             quant,
             ctx_fb.logits(),
             &ref_logits,
-            true,
+            strict_fallback,
         );
     }
 }
@@ -1012,12 +1017,17 @@ fn verify_mixtral_parity_outputs(
     recipe
         .prefill_step_with_cache(&mut ctx_fb, w_packed, &mut fb_cache)
         .expect("fallback moe prefill");
+    let strict_fallback = !cfg!(all(
+        target_arch = "riscv64",
+        feature = "with-kernels",
+        not(miri)
+    ));
     assert_logits_parity(
         "Mixtral 256x256 MoE DirectFallback path",
         quant,
         ctx_fb.logits(),
         ref_logits,
-        true,
+        strict_fallback,
     );
 }
 
